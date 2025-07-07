@@ -1,0 +1,34 @@
+user_prompt: |-
+  ### Task
+  You are given a user query and a set of retrieved documents. Your job is to extract a concise, factual, and relevant answer to the query, using only information from the provided documents.
+
+  ### Instructions
+  1. Carefully read each document and determine if it contains information relevant to the query.
+  2. If you find relevant information, extract and summarize it in 1-3 clear sentences.
+  3. **Do not use any information that is not present in the documents.**
+  4. If none of the documents contain relevant information, state that clearly.
+
+  ### Output Format (CRITICAL - MUST FOLLOW EXACTLY)
+  - Your answer **MUST start with exactly**: ### Extracted Information
+  - On the line(s) after this tag, write the extracted information.
+  - If there is no relevant information, write: No helpful information found.
+  - **IMPORTANT**: Even if the documents are long, you MUST start your answer with ### Extracted Information
+
+  ### Example Output
+  ```
+  ### Extracted Information
+  [Your extracted answer here.]
+  ```
+
+  or
+
+  ```
+  ### Extracted Information
+  No helpful information found.
+  ```
+
+  ### User Query
+  {question}
+
+  ### Documents
+  {documents}

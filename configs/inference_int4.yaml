@@ -1,0 +1,20 @@
+# @package _global_
+defaults:
+  - inference
+  - _self_
+  
+# Override for maximum memory savings with int4 quantization using transformers + bitsandbytes
+name: inference_int4
+exp_name: qwen2.5_7b_hotpot+2wiki-zscore_2-ckpt200-qwq-int4
+
+inference:
+  server_params:
+    log_level: error
+    tp_size: 1
+    dp_size: 1
+    mem_fraction_static: 0.75
+    schedule_conservativeness: 0.3
+    schedule_policy: fcfs
+    # Force transformers+bitsandbytes for maximum memory savings
+    use_transformers_fallback: true
+    quantization: int4  # BitsAndBytes int4 quantization - maximum memory savings 

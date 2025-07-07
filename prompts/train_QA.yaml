@@ -1,0 +1,8 @@
+user_prompt: |-
+  ### Instruction
+  Answer the following question from the user with the help of a Wikipedia search engine. Please reason step by step. You should think about what you need to know in order to answer the question, and then search for that information using the search engine. To perform a search operation, write a web search question and enclose it with <search> and </search>. You will immediately observe a piece of summarized search results within the <information> and </information> tags. You can then use this retrieved information to continue your reasoning. You can repeat the search process many times. Once you think you have all the information you need, you can end the thinking process and provide the final answer. You MUST enclose your final answer with <answer> and </answer>. 
+
+  Now let's begin!
+
+  ### Question
+  {question}
