@@ -109,7 +109,7 @@ def main(cfg):
     data = load_dataset("json", data_files=dataset_path, split="train") # not the actual split
 
     # Limit to only 10 cases for debugging or speed
-    data = data.select(range(min(10, len(data))))
+    data = data.select(range(min(200, len(data))))
 
     if cfg.data.subset_size:
         data = data.shuffle(seed=42).select(range(cfg.data.subset_size))
@@ -129,7 +129,7 @@ def main(cfg):
         tokenizer = None
     data = data.map(lambda x: format_initial_qa_prompt(x, reasoner_user_message_template, reasoner_sys_message, tokenizer, use_openai_format), batched=False)
 
-    summarizer_sys_message = load_sys_message(cfg.model.summarizer_name_or_path)
+
     summarizer_user_message_template = load_user_message_template(cfg.inference.prompt_templates_dir, "default_retrieval_summary")
     if use_openai_format:
         all_sequences = [
@@ -252,7 +252,7 @@ def main(cfg):
                 per_doc_prompts = []
                 doc_titles = []
                 for doc in results:
-                    # Format single doc as context
+                    # Format single doc as context, but only include lines with '### Extracted Information'
                     if 'title' in doc and 'text' in doc:
                         doc_title = doc['title']
                         doc_text = doc['text']
@@ -268,11 +268,20 @@ def main(cfg):
                     else:
                         doc_title = ''
                         doc_text = str(doc)
+                    # Extract only the ### Extracted Information section(s)
+                    extracted_sections = []
+                    for line in doc_text.splitlines():
+                        if line.strip().startswith('### Extracted Information'):
+                            extracted_sections.append(line)
+                    if extracted_sections:
+                        filtered_text = '\n'.join(extracted_sections)
+                    else:
+                        filtered_text = ''
                     doc_titles.append(doc_title)
-                    user_message = per_doc_summary_template.format(question=query, documents=f"Document (Title: {doc_title}): {doc_text}")
+                    user_message = per_doc_summary_template.format(question=query, documents=f"Document (Title: {doc_title}): {filtered_text}")
+                    # Remove system prompt for summarizer
                     messages = [
-                        {"role": "system", "content": summarizer_sys_message},
-                        {"role": "user", "content": user_message},
+                        {"role": "system", "content": user_message},
                     ]
                     prompt = summarizer_tokenizer.apply_chat_template(
                         messages,
@@ -280,14 +289,19 @@ def main(cfg):
                         add_generation_prompt=True,
                     )
                     per_doc_prompts.append(prompt)
-                # Generate per-document summaries
-                per_doc_outputs_raw = summarizer.generate(per_doc_prompts, summarizer_sampling_params)
+                # Generate per-document summaries in batches of 3
+                per_doc_outputs_raw = []
+                batch_size = 3
+                for i in range(0, len(per_doc_prompts), batch_size):
+                    batch_prompts = per_doc_prompts[i:i+batch_size]
+                    per_doc_outputs_raw.extend(summarizer.generate(batch_prompts, {**summarizer_sampling_params, 'batch_size': batch_size}))
                 per_doc_summaries = [parse_summary_generation(out["text"])[1] for out in per_doc_outputs_raw]
 
                 # 2. Aggregate all per-document summaries and generate a final summary
                 summaries_context = "\n\n".join([f"Summary for Document {i+1} (Title: {doc_titles[i]}): {per_doc_summaries[i]}" for i in range(len(per_doc_summaries))])
                 agg_user_message = (
-                    "Given the following summaries of retrieved documents, write a concise, factual, and relevant answer to the user query.\n"
+                    "Given the following summaries of retrieved documents, write the briefest possible answer to the user query, "
+                    "containing only the most essential information. Do not include any unnecessary details.\n"
                     "You must only use information from the summaries.\n"
                     "\n"
                     "### User Query\n"
@@ -297,8 +311,7 @@ def main(cfg):
                     f"{summaries_context}"
                 )
                 agg_messages = [
-                    {"role": "system", "content": summarizer_sys_message},
-                    {"role": "user", "content": agg_user_message},
+                    {"role": "system", "content": agg_user_message},
                 ]
                 agg_prompt = summarizer_tokenizer.apply_chat_template(
                     agg_messages,
@@ -306,7 +319,10 @@ def main(cfg):
                     add_generation_prompt=True,
                 )
                 final_summary_output_raw = summarizer.generate([agg_prompt], summarizer_sampling_params)[0]
+                final_summary_output_raw = f"### Extracted Information\n{final_summary_output_raw.strip()}"
                 final_analysis, final_summary = parse_summary_generation(final_summary_output_raw["text"])
+                # Prepend the tag for consistency
+                
 
                 # 3. Save both per-document summaries and the final summary
                 retrieval_history_entries.append({

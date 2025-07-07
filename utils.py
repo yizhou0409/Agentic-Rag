@@ -71,13 +71,7 @@ def parse_summary_generation(response):
             information = response.split(tag)[1].strip()
             return response, information
         else:
-            # Fallback: try to extract meaningful content even without the tag
-            response_clean = response.strip()
-            if len(response_clean) > 0:
-                # If there's content but no tag, return it with a warning
-                return response, f"[NO TAG FOUND] {response_clean[:200]}..."
-            else:
-                return response, "No useful information is extracted"
+            return response, "No useful information is extracted"
     else:
         raise ValueError(f"Invalid response type: {type(response)}")
     
