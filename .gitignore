@@ -5,4 +5,4 @@ indexes/
 data/
 output/
 outputs/
-__pycache__
+__pycache__/
