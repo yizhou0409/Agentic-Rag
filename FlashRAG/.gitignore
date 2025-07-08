@@ -6,4 +6,5 @@ build/
 dist/*
 upload_pypi.sh
 tests/*
-FlashRAG/
+FlashRAG/*
+bm25/*
