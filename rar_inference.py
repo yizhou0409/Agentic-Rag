@@ -319,8 +319,9 @@ def main(cfg):
                     add_generation_prompt=True,
                 )
                 final_summary_output_raw = summarizer.generate([agg_prompt], summarizer_sampling_params)[0]
-                final_summary_output_raw = f"### Extracted Information\n{final_summary_output_raw.strip()}"
-                final_analysis, final_summary = parse_summary_generation(final_summary_output_raw["text"])
+                # Fix: Use the 'text' field from the dict
+                final_summary_output_raw_tagged = f"### Extracted Information\n{final_summary_output_raw['text'].strip()}"
+                final_analysis, final_summary = parse_summary_generation(final_summary_output_raw_tagged)
                 # Prepend the tag for consistency
                 
 
@@ -330,7 +331,7 @@ def main(cfg):
                     "per_doc_summaries": per_doc_summaries,
                     "per_doc_raw_outputs": [out["text"] for out in per_doc_outputs_raw],
                     "final_summary": final_summary,
-                    "final_summary_raw_output": final_summary_output_raw["text"],
+                    "final_summary_raw_output": final_summary_output_raw['text'],
                     "prompt_and_output": agg_prompt + "\n\n[OUTPUT STARTS HERE]\n\n" + final_analysis + "\n\n" + final_summary
                 })
 
