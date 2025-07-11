@@ -108,8 +108,10 @@ def main(cfg):
     dataset_path = os.path.join(cfg.data.dataset_root_dir, cfg.data.dataset_name, f"{cfg.data.dataset_split}.jsonl")
     data = load_dataset("json", data_files=dataset_path, split="train") # not the actual split
 
-    # Limit to only 10 cases for debugging or speed
-    data = data.select(range(min(100, len(data))))
+    # Limit to only debug_num_examples cases if set in config
+    debug_num_examples = cfg.data.get('debug_num_examples', None)
+    if debug_num_examples is not None:
+        data = data.select(range(min(debug_num_examples, len(data))))
 
     if cfg.data.subset_size:
         data = data.shuffle(seed=42).select(range(cfg.data.subset_size))
