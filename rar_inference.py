@@ -109,7 +109,7 @@ def main(cfg):
     data = load_dataset("json", data_files=dataset_path, split="train") # not the actual split
 
     # Limit to only 10 cases for debugging or speed
-    data = data.select(range(min(200, len(data))))
+    data = data.select(range(min(100, len(data))))
 
     if cfg.data.subset_size:
         data = data.shuffle(seed=42).select(range(cfg.data.subset_size))
