@@ -115,23 +115,42 @@ def main(cfg):
         data = data.shuffle(seed=42).select(range(cfg.data.subset_size))
         logger.info(f"Using a subset of the data: {cfg.data.subset_size}")
     
-    # Load tokenizers for reasoner and summarizer separately
-    reasoner_tokenizer = AutoTokenizer.from_pretrained(cfg.model.reasoner_name_or_path)
-    summarizer_tokenizer = AutoTokenizer.from_pretrained(cfg.model.summarizer_name_or_path)
-    
+    # --- Tokenizer/model loading ---
+    if cfg.model.reasoner_mode in ["openai", "proxy"]:
+        reasoner_tokenizer = None
+    else:
+        reasoner_tokenizer = AutoTokenizer.from_pretrained(cfg.model.reasoner_name_or_path)
+    reasoner_model = GeneratorMixin(
+        mode = cfg.model.reasoner_mode,
+        server_url = cfg.model.reasoner_url,
+        model_name_or_path = cfg.model.reasoner_name_or_path,
+        server_params = OmegaConf.to_container(cfg.inference.server_params),
+    )
+
+    if cfg.model.summarizer_mode in ["openai", "proxy"]:
+        summarizer_tokenizer = None
+    else:
+        summarizer_tokenizer = AutoTokenizer.from_pretrained(cfg.model.summarizer_name_or_path)
+    summarizer_model = GeneratorMixin(
+        mode = cfg.model.summarizer_mode,
+        server_url = cfg.model.summarizer_url,
+        model_name_or_path = cfg.model.summarizer_name_or_path,
+        server_params = OmegaConf.to_container(cfg.inference.server_params),
+    )
+
     reasoner_sys_message = load_sys_message(cfg.model.reasoner_name_or_path)
     reasoner_user_message_template = load_user_message_template(cfg.inference.prompt_templates_dir, cfg.inference.user_message_template_name)
-    # Detect API-call model usage
-    use_openai_format = cfg.model.reasoner_mode == "openai" or cfg.model.summarizer_mode == "openai"
-    if not use_openai_format:
+    # Detect API-call model usage for each
+    use_openai_reasoner = cfg.model.reasoner_mode == "openai"
+    use_openai_summarizer = cfg.model.summarizer_mode == "openai"
+    if not use_openai_reasoner:
         tokenizer = reasoner_tokenizer
     else:
         tokenizer = None
-    data = data.map(lambda x: format_initial_qa_prompt(x, reasoner_user_message_template, reasoner_sys_message, tokenizer, use_openai_format), batched=False)
-
+    data = data.map(lambda x: format_initial_qa_prompt(x, reasoner_user_message_template, reasoner_sys_message, tokenizer, use_openai_reasoner), batched=False)
 
     summarizer_user_message_template = load_user_message_template(cfg.inference.prompt_templates_dir, "default_retrieval_summary")
-    if use_openai_format:
+    if use_openai_reasoner:
         all_sequences = [
             {
                 "messages": item["messages"].copy(),
@@ -150,8 +169,13 @@ def main(cfg):
             } for item in data
         ]
    
-    logger.info(f"Example Prompt:")
-    logger.info(all_sequences[0]["prompt"])
+    logger.info(f"Example Prompt or Messages:")
+    if "prompt" in all_sequences[0]:
+        logger.info(all_sequences[0]["prompt"])
+    elif "messages" in all_sequences[0]:
+        logger.info(all_sequences[0]["messages"])
+    else:
+        logger.info("No prompt or messages found in first sequence.")
 
     # Define the output directory
     output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
@@ -159,22 +183,12 @@ def main(cfg):
     # Initialize the LLM
     server_params = OmegaConf.to_container(cfg.inference.server_params)
     reasoner_sampling_params = OmegaConf.to_container(cfg.inference.reasoner_sampling_params)
-    reasoner_sampling_params["stop"] = [END_OF_SEARCH, END_OF_ANSWER, reasoner_tokenizer.eos_token]
+    if reasoner_tokenizer is not None:
+        reasoner_sampling_params["stop"] = [END_OF_SEARCH, END_OF_ANSWER, reasoner_tokenizer.eos_token]
+    else:
+        # For OpenAI/proxy mode, do not set stop tokens that depend on tokenizer
+        reasoner_sampling_params.pop("stop", None)
     summarizer_sampling_params = OmegaConf.to_container(cfg.inference.summarizer_sampling_params)
-    
-    reasoner = GeneratorMixin(
-        mode = cfg.model.reasoner_mode,
-        server_url = cfg.model.reasoner_url,
-        model_name_or_path = cfg.model.reasoner_name_or_path,
-        server_params = server_params,
-    )
-    
-    summarizer = GeneratorMixin(
-        mode = cfg.model.summarizer_mode,
-        server_url = cfg.model.summarizer_url,
-        model_name_or_path = cfg.model.summarizer_name_or_path,
-        server_params = server_params,
-    )
     
     # Initialize retreiver model and index
     retriever_config = Config(config_dict=OmegaConf.to_container(cfg.retrieval.flashrag_config))
@@ -192,48 +206,117 @@ def main(cfg):
         if 'gold_answer' not in item and 'golden_answers' in item:
             item['gold_answer'] = item['golden_answers']
 
-    # Main Inference Loop
+    # --- Prompt construction and generation ---
+    def build_reasoner_prompt(item, sys_message, user_message_template):
+        if cfg.model.reasoner_mode in ["openai", "proxy"]:
+            messages = []
+            if sys_message:
+                messages.append({"role": "system", "content": sys_message})
+            messages.append({"role": "user", "content": user_message_template.format(question=item["question"])})
+            return messages
+        else:
+            # Local model prompt construction
+            messages = []
+            if sys_message:
+                messages.append({"role": "system", "content": sys_message})
+            messages.append({"role": "user", "content": user_message_template.format(question=item["question"])})
+            prompt = reasoner_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            return {"prompt": prompt}
+
+    def generate_reasoner_output(prompts_or_messages_list):
+        # Accepts a list of prompts or messages and passes them directly to the model's generate method
+        if isinstance(prompts_or_messages_list, dict):
+            prompts_or_messages_list = [prompts_or_messages_list]
+        outputs = reasoner_model.generate(prompts_or_messages_list, sampling_params=reasoner_sampling_params)
+        return outputs
+
+    def build_summarizer_prompt(search_queries, search_results, user_message_template, sys_message):
+        if cfg.model.summarizer_mode in ["openai", "proxy"]:
+            messages = []
+            if sys_message:
+                messages.append({"role": "system", "content": sys_message})
+            user_content = user_message_template.format(question=search_queries[0], documents="") # Assuming first query for user prompt
+            messages.append({"role": "user", "content": user_content})
+            return messages
+        else:
+            # Local model prompt construction
+            def format_doc(doc):
+                title = doc.get('title', doc.get('id', 'Unknown'))
+                text = doc.get('text', doc.get('content', str(doc)))
+                return f"Document (Title: {title}): {text}"
+            retrieved_context = "\n\n".join([format_doc(result) for result in search_results[0]]) # Assuming first query for context
+            user_content = user_message_template.format(question=search_queries[0], documents=retrieved_context)
+            messages = [
+                {"role": "system", "content": user_content},
+            ]
+            prompt = summarizer_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            return {"prompt": prompt}
+
+    def generate_summarizer_output(prompts_or_messages_list):
+        # Accepts a list of prompts or messages and passes them directly to the model's generate method
+        if isinstance(prompts_or_messages_list, dict):
+            prompts_or_messages_list = [prompts_or_messages_list]
+        # If in offline mode, extract the 'prompt' string from each dict
+        if not use_openai_summarizer:
+            prompts_or_messages_list = [p["prompt"] for p in prompts_or_messages_list]
+        outputs = summarizer_model.generate(prompts_or_messages_list, sampling_params=summarizer_sampling_params)
+        return outputs
+
+    # --- Main loop and output handling ---
     turn = 0
     active_sequences = all_sequences
+    # Log first summarizer prompt/messages for debugging
+    if use_openai_summarizer:
+        logger.info(f"Example Summarizer Messages: {summarizer_user_message_template}")
+    else:
+        logger.info(f"Example Summarizer Prompt: {summarizer_user_message_template}")
     while turn < cfg.inference.max_turns:
         if not active_sequences:
             break
-        
         turn += 1
         print(f'\n\n-------------- Turn {turn} --------------')
         print(f'# Active Sequences: {len(active_sequences)}')
 
-        # Generate responses
-        prompts = [seq["prompt"] for seq in active_sequences]
+        # --- Reasoner Generation ---
+        if use_openai_reasoner:
+            reasoner_prompts = [seq["messages"] for seq in active_sequences]
+        else:
+            reasoner_prompts = [seq["prompt"] for seq in active_sequences]
         start_time = time.time()
-        outputs = reasoner.generate(prompts, sampling_params=reasoner_sampling_params)
+        reasoner_outputs = generate_reasoner_output(reasoner_prompts)
         end_time = time.time()
         gen_time = end_time - start_time
         logger.info(f"Reasoning Generation time: {gen_time:.2f} seconds")
         print(f"[Turn {turn}] Generation time: {gen_time:.2f} seconds")
 
         search_queries = []
-
-        for seq, out in zip(active_sequences, outputs):
+        for seq, out in zip(active_sequences, reasoner_outputs):
             generated = out["text"]
-            
             seq["output"] += generated
             thought, search_q, answer = parse_reasoning_generation(generated)
-
             if search_q:
                 search_queries.append(search_q)
-                seq["prompt"] += generated.rstrip() # generation sometimes ends on </search>\n\n\n with arbitrary number of newlines. We add two newlines before the <information> token in later code.
+                if use_openai_reasoner:
+                    seq["messages"].append({"role": "assistant", "content": generated.rstrip()})
+                else:
+                    seq["prompt"] += generated.rstrip()
             elif answer:
                 seq["finished"] = True
                 seq["answer"] = answer
             else:
-                # invalid
                 seq["finished"] = True
                 seq["answer"] = ""
-        
         active_sequences = [seq for seq in active_sequences if not seq["finished"]]
-        
-        # Perform search and summarize
+
+        # --- Retrieval and Summarization ---
         if search_queries:
             start_search_time = time.time()
             search_results = retriever.batch_search(search_queries)
@@ -242,122 +325,141 @@ def main(cfg):
             logger.info(f"Retrieval time: {ret_time:.2f} seconds")
             print(f"[Turn {turn}] Retrieval time: {ret_time:.2f} seconds")
 
-            per_doc_summary_template = summarizer_user_message_template  # Use the same template for per-doc
-            per_doc_summaries_all = []
-            final_summary_outputs = []
-            retrieval_history_entries = []
-
-            for query, results in zip(search_queries, search_results):
-                # 1. Summarize each document individually
-                per_doc_prompts = []
-                doc_titles = []
-                for doc in results:
-                    # Format single doc as context, but only include lines with '### Extracted Information'
-                    if 'title' in doc and 'text' in doc:
-                        doc_title = doc['title']
-                        doc_text = doc['text']
-                    elif 'title' in doc and 'contents' in doc:
-                        doc_title = doc['title']
-                        doc_text = doc['contents']
-                    elif 'text' in doc:
-                        doc_title = ''
-                        doc_text = doc['text']
-                    elif 'contents' in doc:
-                        doc_title = ''
-                        doc_text = doc['contents']
+            summarizer_prompt = build_summarizer_prompt(search_queries, search_results, summarizer_user_message_template, None)
+            # Always pass a list to generate_summarizer_output, but avoid double-wrapping
+            summarizer_output = generate_summarizer_output(summarizer_prompt)
+            summary_outputs = [parse_summary_generation(out["text"]) for out in summarizer_output]
+            # Update input prompts for the next turn
+            if summary_outputs:
+                for seq, out in zip(active_sequences, summary_outputs):
+                    summary = out[1].strip()
+                    append_summary = f"{BEGIN_OF_INFO} {summary} {END_OF_INFO}\n\n"
+                    if use_openai_reasoner:
+                        seq["messages"].append({"role": "user", "content": append_summary})
                     else:
-                        doc_title = ''
-                        doc_text = str(doc)
-                    # Extract only the ### Extracted Information section(s)
-                    extracted_sections = []
-                    for line in doc_text.splitlines():
-                        if line.strip().startswith('### Extracted Information'):
-                            extracted_sections.append(line)
-                    if extracted_sections:
-                        filtered_text = '\n'.join(extracted_sections)
-                    else:
-                        filtered_text = ''
-                    doc_titles.append(doc_title)
-                    user_message = per_doc_summary_template.format(question=query, documents=f"Document (Title: {doc_title}): {filtered_text}")
-                    # Remove system prompt for summarizer
-                    messages = [
-                        {"role": "system", "content": user_message},
-                    ]
-                    prompt = summarizer_tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
+                        seq["prompt"] += append_summary
+                    seq["output"] += append_summary
+            else:
+                # --- Original per-document summarization and aggregation logic for local mode ---
+                per_doc_summary_template = summarizer_user_message_template
+                per_doc_summaries_all = []
+                final_summary_outputs = []
+                retrieval_history_entries = []
+                for query, results in zip(search_queries, search_results):
+                    per_doc_prompts = []
+                    doc_titles = []
+                    for doc in results:
+                        # Format single doc as context, but only include lines with '### Extracted Information'
+                        if 'title' in doc and 'text' in doc:
+                            doc_title = doc['title']
+                            doc_text = doc['text']
+                        elif 'title' in doc and 'contents' in doc:
+                            doc_title = doc['title']
+                            doc_text = doc['contents']
+                        elif 'text' in doc:
+                            doc_title = ''
+                            doc_text = doc['text']
+                        elif 'contents' in doc:
+                            doc_title = ''
+                            doc_text = doc['contents']
+                        else:
+                            doc_title = ''
+                            doc_text = str(doc)
+                        extracted_sections = []
+                        for line in doc_text.splitlines():
+                            if line.strip().startswith('### Extracted Information'):
+                                extracted_sections.append(line)
+                        if extracted_sections:
+                            filtered_text = '\n'.join(extracted_sections)
+                        else:
+                            filtered_text = ''
+                        doc_titles.append(doc_title)
+                        user_message = per_doc_summary_template.format(question=query, documents=f"Document (Title: {doc_title}): {filtered_text}")
+                        messages = [
+                            {"role": "system", "content": user_message},
+                        ]
+                        if summarizer_tokenizer is not None:
+                            prompt = summarizer_tokenizer.apply_chat_template(
+                                messages,
+                                tokenize=False,
+                                add_generation_prompt=True,
+                            )
+                        else:
+                            prompt = messages
+                        per_doc_prompts.append(prompt)
+                    per_doc_outputs_raw = []
+                    batch_size = 3
+                    for i in range(0, len(per_doc_prompts), batch_size):
+                        batch_prompts = per_doc_prompts[i:i+batch_size]
+                        if not isinstance(batch_prompts, list):
+                            batch_prompts = [batch_prompts]
+                        per_doc_outputs_raw.extend(summarizer_model.generate(batch_prompts, {**summarizer_sampling_params, 'batch_size': batch_size}))
+                    per_doc_summaries = [parse_summary_generation(out["text"])[1] for out in per_doc_outputs_raw]
+                    summaries_context = "\n\n".join([f"Summary for Document {i+1} (Title: {doc_titles[i]}): {per_doc_summaries[i]}" for i in range(len(per_doc_summaries))])
+                    agg_user_message = (
+                        "Given the following summaries of retrieved documents, write the briefest possible answer to the user query, "
+                        "containing only the most essential information. Do not include any unnecessary details.\n"
+                        "You must only use information from the summaries.\n"
+                        "\n"
+                        "### User Query\n"
+                        f"{query}\n"
+                        "\n"
+                        "### Document Summaries\n"
+                        f"{summaries_context}"
                     )
-                    per_doc_prompts.append(prompt)
-                # Generate per-document summaries in batches of 3
-                per_doc_outputs_raw = []
-                batch_size = 3
-                for i in range(0, len(per_doc_prompts), batch_size):
-                    batch_prompts = per_doc_prompts[i:i+batch_size]
-                    per_doc_outputs_raw.extend(summarizer.generate(batch_prompts, {**summarizer_sampling_params, 'batch_size': batch_size}))
-                per_doc_summaries = [parse_summary_generation(out["text"])[1] for out in per_doc_outputs_raw]
+                    agg_messages = [
+                        {"role": "system", "content": agg_user_message},
+                    ]
+                    if summarizer_tokenizer is not None:
+                        agg_prompt = summarizer_tokenizer.apply_chat_template(
+                            agg_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                    else:
+                        agg_prompt = agg_messages
+                    # Always pass a list
+                    final_summary_output_raw = summarizer_model.generate([agg_prompt], summarizer_sampling_params)[0]
+                    final_summary_output_raw_tagged = f"### Extracted Information\n{final_summary_output_raw['text'].strip()}"
+                    if summarizer_tokenizer is not None:
+                        final_analysis, final_summary = parse_summary_generation(final_summary_output_raw_tagged)
+                    else:
+                        final_summary_output_raw = summarizer_model.generate([agg_prompt], summarizer_sampling_params)[0]
+                        final_summary_output_raw_tagged = f"### Extracted Information\n{final_summary_output_raw['text'].strip()}"
+                        final_analysis, final_summary = parse_summary_generation(final_summary_output_raw_tagged)
+                    retrieval_history_entries.append({
+                        "query": query,
+                        "per_doc_summaries": per_doc_summaries,
+                        "per_doc_raw_outputs": [out["text"] for out in per_doc_outputs_raw],
+                        "final_summary": final_summary,
+                        "final_summary_raw_output": final_summary_output_raw['text'],
+                        "prompt_and_output": agg_prompt if summarizer_tokenizer is None else agg_prompt + "\n\n[OUTPUT STARTS HERE]\n\n" + final_analysis + "\n\n" + final_summary
+                    })
+                retrieval_history.extend(retrieval_history_entries)
+                for seq, entry in zip(active_sequences, retrieval_history_entries):
+                    summary = entry["final_summary"].strip()
+                    append_summary = f"{BEGIN_OF_INFO} {summary} {END_OF_INFO}\n\n"
+                    if use_openai_reasoner:
+                        seq["messages"].append({"role": "user", "content": append_summary})
+                    else:
+                        seq["prompt"] += append_summary
+                    seq["output"] += append_summary
 
-                # 2. Aggregate all per-document summaries and generate a final summary
-                summaries_context = "\n\n".join([f"Summary for Document {i+1} (Title: {doc_titles[i]}): {per_doc_summaries[i]}" for i in range(len(per_doc_summaries))])
-                agg_user_message = (
-                    "Given the following summaries of retrieved documents, write the briefest possible answer to the user query, "
-                    "containing only the most essential information. Do not include any unnecessary details.\n"
-                    "You must only use information from the summaries.\n"
-                    "\n"
-                    "### User Query\n"
-                    f"{query}\n"
-                    "\n"
-                    "### Document Summaries\n"
-                    f"{summaries_context}"
-                )
-                agg_messages = [
-                    {"role": "system", "content": agg_user_message},
-                ]
-                agg_prompt = summarizer_tokenizer.apply_chat_template(
-                    agg_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                final_summary_output_raw = summarizer.generate([agg_prompt], summarizer_sampling_params)[0]
-                # Fix: Use the 'text' field from the dict
-                final_summary_output_raw_tagged = f"### Extracted Information\n{final_summary_output_raw['text'].strip()}"
-                final_analysis, final_summary = parse_summary_generation(final_summary_output_raw_tagged)
-                # Prepend the tag for consistency
-                
-
-                # 3. Save both per-document summaries and the final summary
-                retrieval_history_entries.append({
-                    "query": query,
-                    "per_doc_summaries": per_doc_summaries,
-                    "per_doc_raw_outputs": [out["text"] for out in per_doc_outputs_raw],
-                    "final_summary": final_summary,
-                    "final_summary_raw_output": final_summary_output_raw['text'],
-                    "prompt_and_output": agg_prompt + "\n\n[OUTPUT STARTS HERE]\n\n" + final_analysis + "\n\n" + final_summary
-                })
-
-            retrieval_history.extend(retrieval_history_entries)
-
-            # Update input prompts for the next turn (use the final summary)
-            for seq, entry in zip(active_sequences, retrieval_history_entries):
-                summary = entry["final_summary"].strip()
-                append_summary = f"{BEGIN_OF_INFO} {summary} {END_OF_INFO}\n\n" # not anding the <think> token here
-                seq["prompt"] += append_summary
-                seq["output"] += append_summary
-
-    # if there are still active sequences, we force them to finish by adding a short thought
+    # --- Force finish for remaining active sequences ---
     print("-------- Turn limit reached. (Soft) Forcing active sequences to finish. --------")
     for seq in active_sequences:
         timeout_message = f"Time is up.\n\nSince I have searched for {cfg.inference.max_turns} times, I am not allowed to search anymore. I should give a final answer now with the information I have."
-        seq["prompt"] += timeout_message
+        if use_openai_reasoner:
+            seq["messages"].append({"role": "user", "content": timeout_message})
+        else:
+            seq["prompt"] += timeout_message
         seq["output"] += timeout_message
-    prompts = [seq["prompt"] for seq in active_sequences]
-    # outputs = llm.generate(prompts, sampling_params=sampling_params)
-    # outputs = requests.post(
-    #     cfg.model.llm_client_url+"/generate",
-    #     json={"text": prompts, "sampling_params": llm_sampling_params},
-    # ).json()
-    outputs = reasoner.generate(prompts, reasoner_sampling_params)
-    for seq, out in zip(active_sequences, outputs):
+    if use_openai_reasoner:
+        reasoner_prompts = [seq["messages"] for seq in active_sequences]
+    else:
+        reasoner_prompts = [seq["prompt"] for seq in active_sequences]
+    reasoner_outputs = generate_reasoner_output(reasoner_prompts)
+    for seq, out in zip(active_sequences, reasoner_outputs):
         generated = out["text"]
         seq["output"] += generated
         thought, search_q, answer = parse_reasoning_generation(generated)
@@ -368,19 +470,20 @@ def main(cfg):
             seq["finished"] = True
             seq["answer"] = ""
 
-    reasoner.shutdown()
-    summarizer.shutdown()
+    # --- Shutdown models if present ---
+    if reasoner_model is not None:
+        reasoner_model.shutdown()
+    if summarizer_model is not None:
+        summarizer_model.shutdown()
 
-    # Evaluate the generated answers
+    # --- Evaluate the generated answers ---
     metrics_list, metrics_agg = run_evaluation(data, all_sequences)
     logger.info(f"Metrics: {metrics_agg}")
-    
-    # --- New: Analyze retrieval counts and metrics by retrieval times ---
+
+    # --- Analyze retrieval counts and metrics by retrieval times ---
     retrieval_to_metrics = defaultdict(list)
     for m in metrics_list:
         retrieval_to_metrics[m['num_retrieval']].append(m)
-
-    # Compute average metrics for each retrieval count
     retrieval_counts = sorted(retrieval_to_metrics.keys())
     avg_em = []
     avg_cover = []
@@ -390,8 +493,6 @@ def main(cfg):
         avg_em.append(sum(x['em'] for x in ms) / len(ms))
         avg_cover.append(sum(x['cover_match'] for x in ms) / len(ms))
         avg_f1.append(sum(x['str_f1'] for x in ms) / len(ms))
-
-    # Plot
     plt.figure(figsize=(8,6))
     plt.plot(retrieval_counts, avg_em, marker='o', label='EM')
     plt.plot(retrieval_counts, avg_cover, marker='s', label='Cover Match')
@@ -404,31 +505,35 @@ def main(cfg):
     plot_path = f"{output_dir}/metrics_by_retrieval_count.png"
     plt.savefig(plot_path)
     print(f"Saved retrieval-metrics plot to {plot_path}")
-    
-    # --- New: Print average retrievals per case ---
+
+    # --- Print average retrievals per case ---
     if metrics_list and len(metrics_list) > 0:
         avg_retrievals = sum(m['num_retrieval'] for m in metrics_list) / len(metrics_list)
         print(f"Average retrievals per case: {avg_retrievals:.2f}")
     else:
         print("No cases to compute average retrievals.")
-    
+
     # --- Compute and print average output tokens ---
     output_token_counts = []
     for seq in all_sequences:
-        tokens = reasoner_tokenizer.encode(seq["output"])
-        output_token_counts.append(len(tokens))
+        # Only count tokens if tokenizer is available (offline mode)
+        if reasoner_tokenizer is not None:
+            tokens = reasoner_tokenizer.encode(seq["output"])
+            output_token_counts.append(len(tokens))
     if output_token_counts:
         avg_output_tokens = sum(output_token_counts) / len(output_token_counts)
         print(f"Average output tokens per case: {avg_output_tokens:.2f}")
     else:
         print("No outputs to compute average token count.")
-    
-    # save outputs
+
+    # --- Save outputs ---
     t = datetime.datetime.now()
     outputs = []
     for item, seq, metrics in zip(data, all_sequences, metrics_list):
         outputs.append({
-            "prompt": seq["prompt"],
+            # Save the correct prompt/messages for each mode
+            "prompt": seq["prompt"] if "prompt" in seq else None,
+            "messages": seq["messages"] if "messages" in seq else None,
             "output": seq["output"],
             "question": item["question"],
             "pred": seq["answer"],
@@ -441,12 +546,12 @@ def main(cfg):
     with open(f"{output_dir}/{output_file_name}", "w") as f:
         json.dump(outputs, f, indent=2)
 
-    # save retrieval history
+    # --- Save retrieval history ---
     retrieval_history_file_name = f'retrieval_history_{t.strftime("%m-%d-%H-%M-%S")}.json'
     with open(f"{output_dir}/{retrieval_history_file_name}", "w") as f:
         json.dump(retrieval_history, f, indent=2)
-    
-    # save metrics 
+
+    # --- Save metrics ---
     metrics_file_name = f'metrics_{t.strftime("%m-%d-%H-%M-%S")}.json'
     with open(f"{output_dir}/{metrics_file_name}", "w") as f:
         json.dump(metrics_agg, f, indent=2)

@@ -2,6 +2,12 @@ import json
 import requests
 import sglang as sgl
 import re
+import os
+
+try:
+    import openai
+except ImportError:
+    openai = None
 
 class GeneratorMixin:
     def __init__(self, mode, server_url=None, model_name_or_path=None, server_params=None):
@@ -31,7 +37,8 @@ class GeneratorMixin:
         differences = {
             'offline': 'other',
             'localhost': '/generate',
-            'proxy': '/llm'
+            'proxy': '/llm',
+            'openai': 'openai'
         }
         mode_diff = differences.get(self.mode, False)
         if not mode_diff:
@@ -39,6 +46,11 @@ class GeneratorMixin:
         else:
             if mode_diff == 'other':
                 self._init_offline_model()
+            elif mode_diff == 'openai':
+                if openai is None:
+                    raise ImportError("openai package is required for openai mode. Please install it with 'pip install openai'.")
+                # No further init needed for openai
+                pass
             else:
                 self.server_url = self.server_url + mode_diff
                 self._test_server_status()
@@ -111,26 +123,27 @@ class GeneratorMixin:
             
             # Check if int8 quantization is requested
             quantization_type = self.server_params.get('quantization', None)
+            llm_int8_enable_fp32_cpu_offload = self.server_params.get('llm_int8_enable_fp32_cpu_offload', False)
             
             if quantization_type == 'int8':
-                # Configure BitsAndBytes for int8 quantization without CPU offload
+                # Configure BitsAndBytes for int8 quantization, CPU offload from config
                 bnb_config = BitsAndBytesConfig(
                     load_in_8bit=True,
                     llm_int8_threshold=6.0,
                     llm_int8_has_fp16_weight=False,
-                    llm_int8_enable_fp32_cpu_offload=False,  # Disable CPU offload
+                    llm_int8_enable_fp32_cpu_offload=llm_int8_enable_fp32_cpu_offload,
                 )
-                print("Loading model with int8 quantization and CPU offload disabled...")
+                print(f"Loading model with int8 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
             elif quantization_type == 'int4':
-                # Configure BitsAndBytes for int4 quantization without CPU offload
+                # Configure BitsAndBytes for int4 quantization, CPU offload from config
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.float16,
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_quant_type="nf4",
-                    llm_int8_enable_fp32_cpu_offload=False  # Disable CPU offload for int4 as well
+                    llm_int8_enable_fp32_cpu_offload=llm_int8_enable_fp32_cpu_offload
                 )
-                print("Loading model with int4 quantization and CPU offload disabled...")
+                print(f"Loading model with int4 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
             else:
                 bnb_config = None
                 print("Loading model without quantization...")
@@ -188,6 +201,8 @@ class GeneratorMixin:
             return self._generate_localhost(prompts, sampling_params)
         elif self.mode == 'proxy':
             return self._generate_proxy(prompts, sampling_params)
+        elif self.mode == 'openai':
+            return self._generate_openai(prompts, sampling_params)
 
     def _generate_transformers(self, prompts, sampling_params={}):
         """
@@ -296,6 +311,39 @@ class GeneratorMixin:
         for out in response:
             out['text'] = out['text'].strip()
         return response
+    
+    def _generate_openai(self, prompts, sampling_params={}):
+        """
+        Generate responses using the OpenAI API (chat/completions endpoint).
+        prompts: list of messages (OpenAI chat format)
+        sampling_params: dict of OpenAI parameters (e.g., temperature, max_tokens)
+        """
+        api_key = os.environ.get("OPENAI_API_KEY", self.server_params.get("api_key"))
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable or api_key in server_params must be set for openai mode.")
+        import openai as _openai
+        _openai.api_key = api_key
+        model = self.model_name_or_path or self.server_params.get("model", "gpt-4o")
+        results = []
+        for messages in prompts:
+            # Ensure messages is a list of dicts for OpenAI API
+            if isinstance(messages, dict):
+                messages = [messages]
+            # Map max_new_tokens to max_tokens for OpenAI API
+            params = {k: v for k, v in sampling_params.items() if v is not None}
+            if "max_new_tokens" in params:
+                params["max_tokens"] = params.pop("max_new_tokens")
+            # Remove any other unsupported keys
+            for unsupported in ["no_stop_trim", "repetition_penalty", "stop"]:
+                params.pop(unsupported, None)
+            response = _openai.chat.completions.create(
+                model=model,
+                messages=messages,
+                **params
+            )
+            text = response.choices[0].message.content
+            results.append({"text": text})
+        return results
     
     def shutdown(self):
         """

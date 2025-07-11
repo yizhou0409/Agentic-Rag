@@ -6,3 +6,7 @@ data/
 output/
 outputs/
 __pycache__/
+FlashRAG/
+bm25/
+slurm/
+configs/
