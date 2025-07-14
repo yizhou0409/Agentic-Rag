@@ -1,169 +1,129 @@
 import re
-
+from typing import List, Dict, Tuple, Any
 from utils import normalize_answer_qa, string_f1
 
-def run_evaluation(data, all_sequences):
-    # initialize the metrics
-    metrics_list = []
-    metrics_agg = {
-        "em": 0,
-        "cover_match": 0,
-        "str_f1": 0,
-        "valid": 0,
-        "finished": 0,
-        "num_retrieval": 0,
-        "num_fail_retrieval": 0,
+def run_evaluation(
+    data: List[Dict[str, Any]],
+    all_sequences: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
+    """
+    Evaluate predictions against gold answers with multiple metrics.
+    Args:
+        data: List of data items, each with 'question' and 'golden_answers'.
+        all_sequences: List of prediction dicts, each with 'output', 'answer', 'finished'.
+    Returns:
+        metrics_list: List of per-example metric dicts.
+        metrics_agg: Dict of averaged metrics over the dataset.
+    """
+    metrics_list: List[Dict[str, float]] = []
+    metrics_agg: Dict[str, float] = {
+        "em": 0.0,
+        "cover_match": 0.0,
+        "str_f1": 0.0,
+        "valid": 0.0,
+        "finished": 0.0,
+        "num_retrieval": 0.0,
+        "num_fail_retrieval": 0.0,
     }
 
-    # iterate over the data and the sequences
     for item, seq in zip(data, all_sequences):
-        output = seq["output"]
-        pred = seq['answer']
-        question = item['question']
-        gold_answer = item["golden_answers"] # a list of acceptable answers
+        output = seq.get("output", "")
+        pred = seq.get('answer', "")
+        gold_answers = item.get("golden_answers", [])
 
-        # if the prediction is empty, set the metric to 0 and the valid flag to 0 to indicate the invalidality
-        if pred == "":
-            em, cover_match, str_f1, valid = 0, 0, 0, 0
-
-        # if the prediction is not empty, evluate with the metrics
+        if not pred:
+            em = cover_match = str_f1 = valid = 0.0
         else:
-            norm_pred = normalize_answer_qa (pred)
-            norm_gold = [normalize_answer_qa(g) for g in gold_answer]
+            norm_pred = normalize_answer_qa(pred)
+            norm_gold = [normalize_answer_qa(g) for g in gold_answers]
+            em = float(norm_pred in norm_gold)
+            cover_match = float(any(g in norm_pred for g in norm_gold))
+            str_f1 = max([string_f1(norm_pred, g) for g in norm_gold]) if norm_gold else 0.0
+            valid = 1.0
 
-            # evaluate the exact match
+        num_search = float(len(re.findall(r"<search>.*?</search>", output, flags=re.DOTALL)))
+        num_fail = float(len(re.findall(r"<information>\s*No helpful information found\s*</information>", output, flags=re.DOTALL)))
 
-            # if the prediction is directly in the gold answer, set the em to 1
-            em = int(norm_pred in norm_gold)
-
-            # if the prediction is longer but contain the exactly same information in the gold answer, set the cover_match to 1
-            cover_match = int(any([g in norm_pred for g in norm_gold]))
-
-            # evaluate the string f1 score, to avoid the case that the predcition is not the same since some words are not the same, but f1 score is still high, we evaluate it as pass the test
-            str_f1 = max([string_f1(norm_pred, g) for g in norm_gold])
-            
-            # set the valid flag to 1 to indicate that the prediction is valid and can be used for further evaluation
-            valid = 1
-
-        # count the number of search queries
-        matches = re.findall(r"<search>.*?</search>", output, flags=re.DOTALL)
-        num_search = len(matches)
-
-        # count the number of failed retrievals
-        matches = re.findall(r"<information>\s*No helpful information found\s*</information>", output, flags=re.DOTALL)
-        num_fail = len(matches)
-
-        # update the metrics aggrations for the current item
         metrics_agg["num_retrieval"] += num_search
         metrics_agg["num_fail_retrieval"] += num_fail
         metrics_agg["em"] += em
         metrics_agg["cover_match"] += cover_match
         metrics_agg["str_f1"] += str_f1
         metrics_agg["valid"] += valid
-        metrics_agg["finished"] += int(seq['finished'])
+        metrics_agg["finished"] += float(seq.get('finished', 0))
 
-        # append the metrics to the list
-        metrics_list.append(
-            {
-                "em": em,
-                "cover_match": cover_match,
-                "str_f1": str_f1,
-                "valid": valid,
-                "finished": int(seq['finished']),
-                "num_retrieval": num_search,
-                "num_fail_retrieval": num_fail,
-            }
-        )
-    
-    # calculate the average metrics
-    for k in metrics_agg.keys():
-        metrics_agg[k] /= len(data)
+        metrics_list.append({
+            "em": em,
+            "cover_match": cover_match,
+            "str_f1": str_f1,
+            "valid": valid,
+            "finished": float(seq.get('finished', 0)),
+            "num_retrieval": num_search,
+            "num_fail_retrieval": num_fail,
+        })
 
-    # return the metrics list and the average metrics as the evaluation results
+    n = float(len(data)) if data else 1.0
+    for k in metrics_agg:
+        metrics_agg[k] /= n
+
     return metrics_list, metrics_agg
 
-def run_evaluation_simple(data, all_sequences):
-    # initialize the metrics
-    metrics_list = []
-    metrics_agg = {
-        "em": 0,
-        "cover_match": 0,
-        "str_f1": 0,
-    }
+def run_evaluation_simple(
+    data: List[Dict[str, Any]],
+    all_sequences: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
+    """
+    Simpler evaluation: only EM, cover_match, and string F1.
+    Args:
+        data: List of data items, each with 'question' and 'golden_answers'.
+        all_sequences: List of prediction dicts, each with 'output', 'answer'.
+    Returns:
+        metrics_list: List of per-example metric dicts.
+        metrics_agg: Dict of averaged metrics over the dataset.
+    """
+    metrics_list: List[Dict[str, float]] = []
+    metrics_agg: Dict[str, float] = {"em": 0.0, "cover_match": 0.0, "str_f1": 0.0}
 
-    # iterate over the data and the sequences
     for item, seq in zip(data, all_sequences):
-        output = seq["output"]
-        pred = seq['answer']
-        question = item['question']
-        gold_answer = item["golden_answers"] # a list of acceptable answers
-
-        # if the prediction is empty, set the metric to 0 and the valid flag to 0 to indicate the invalidality
-        if pred == "":
-            em, cover_match, str_f1 = 0, 0, 0
-
-        # if the prediction is not empty, evluate with the metrics
+        pred = seq.get('answer', "")
+        gold_answers = item.get("golden_answers", [])
+        if not pred:
+            em = cover_match = str_f1 = 0.0
         else:
-            norm_pred = normalize_answer_qa (pred)
-            norm_gold = [normalize_answer_qa(g) for g in gold_answer]
-
-            # evaluate the exact match
-
-            # if the prediction is directly in the gold answer, set the em to 1
-            em = int(norm_pred in norm_gold)
-
-            # if the prediction is longer but contain the exactly same information in the gold answer, set the cover_match to 1
-            cover_match = int(any([g in norm_pred for g in norm_gold]))
-
-            # evaluate the string f1 score, to avoid the case that the predcition is not the same since some words are not the same, but f1 score is still high, we evaluate it as pass the test
-            str_f1 = max([string_f1(norm_pred, g) for g in norm_gold])
-
-        # update the metrics aggrations for the current item
+            norm_pred = normalize_answer_qa(pred)
+            norm_gold = [normalize_answer_qa(g) for g in gold_answers]
+            em = float(norm_pred in norm_gold)
+            cover_match = float(any(g in norm_pred for g in norm_gold))
+            str_f1 = max([string_f1(norm_pred, g) for g in norm_gold]) if norm_gold else 0.0
         metrics_agg["em"] += em
         metrics_agg["cover_match"] += cover_match
         metrics_agg["str_f1"] += str_f1
+        metrics_list.append({"em": em, "cover_match": cover_match, "str_f1": str_f1})
 
-        # append the metrics to the list
-        metrics_list.append(
-            {
-                "em": em,
-                "cover_match": cover_match,
-                "str_f1": str_f1,
-            }
-        )
-    
-    # calculate the average metrics
-    for k in metrics_agg.keys():
-        metrics_agg[k] /= len(data)
+    n = float(len(data)) if data else 1.0
+    for k in metrics_agg:
+        metrics_agg[k] /= n
+    return metrics_list, metrics_agg
 
-# test the functions
 if __name__ == "__main__":
     import argparse
     import json
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, required=True)
-
+    parser.add_argument("--data", type=str, required=True, help="Path to input data (JSON file)")
     args = parser.parse_args()
 
-    args = parser.parse_args()
-
-    with open(args.output, "r") as f:
+    with open(args.data, "r") as f:
         outputs = json.load(f)
 
     data = [
-        {
-            "question": item["question"],
-            "golden_answers": item["gold"],
-        }
+        {"question": item["question"], "golden_answers": item["gold"]}
         for item in outputs
     ]
-
     for item in outputs:
-        item['finished'] = int(item["pred"] != "")
-        item['answer'] = item["pred"]
+        item['finished'] = float(item.get("pred", "") != "")
+        item['answer'] = item.get("pred", "")
 
     metric_list, metrics_agg = run_evaluation(data, outputs)
-
     print(metrics_agg)
     

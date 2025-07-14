@@ -3,73 +3,90 @@ import requests
 import sglang as sgl
 import re
 import os
+import logging
+from typing import List, Dict, Any, Optional, Union, cast
+from dataclasses import dataclass
 
 try:
     import openai
 except ImportError:
     openai = None
 
-class GeneratorMixin:
-    def __init__(self, mode, server_url=None, model_name_or_path=None, server_params=None):
-        """
-        Define a GeneratorMixin class to generate RARs.
+logger = logging.getLogger(__name__)
 
-        Args:
-            mode: The mode of the generator, can be "local" or "remote".
-            server_url: The url of the server, only used when mode is "remote".
-            model_name_or_path: The name or path of the model, only used when mode is "local".
-            server_params: The parameters for the server, only used when mode is "remote".
+@dataclass
+class GenerationConfig:
+    """Configuration for model generation parameters."""
+    max_new_tokens: int = 512
+    temperature: float = 0.6
+    top_p: float = 0.95
+    repetition_penalty: float = 1.0
+
+class GeneratorMixin:
+    """
+    A mixin class for generating RAR (Reasoning and Retrieval) responses.
+    Supports multiple modes: offline (local), localhost, proxy, and OpenAI.
+    """
+    
+    def __init__(
+        self, 
+        mode: str, 
+        server_url: Optional[str] = None, 
+        model_name_or_path: Optional[str] = None, 
+        server_params: Optional[Dict[str, Any]] = None
+    ):
         """
-        # initialize the basic attributes that will be used in all cases
+        Initialize the GeneratorMixin.
+        
+        Args:
+            mode: The generation mode ('offline', 'localhost', 'proxy', 'openai').
+            server_url: The server URL for remote modes.
+            model_name_or_path: The model path or name.
+            server_params: Additional server parameters.
+            
+        Raises:
+            ValueError: If mode is not supported.
+            ImportError: If required packages are not available.
+        """
         self.server_url = server_url
         self.mode = mode
         self.model_name_or_path = model_name_or_path
         self.server_params = server_params or {}
-
-        # use the post init method to set up the difference in the mode
         self._post_init()
 
-    def _post_init(self):
-        """
-        Post-initialization method to set up any additional configuration
-        This method can be overidden in subclasses for custom behavior
-        """
-        differences = {
+    def _post_init(self) -> None:
+        """Post-initialization setup based on mode."""
+        mode_configs = {
             'offline': 'other',
             'localhost': '/generate',
             'proxy': '/llm',
             'openai': 'openai'
         }
-        mode_diff = differences.get(self.mode, False)
+        
+        mode_diff = mode_configs.get(self.mode)
         if not mode_diff:
-            raise ValueError(f"Invalid mode: {self.mode}. Supported modes are: {', '.join(differences.keys())}. Your mode is {self.mode}")
+            supported_modes = ', '.join(mode_configs.keys())
+            raise ValueError(f"Invalid mode: {self.mode}. Supported modes: {supported_modes}")
+        
+        if mode_diff == 'other':
+            self._init_offline_model()
+        elif mode_diff == 'openai':
+            if openai is None:
+                raise ImportError("openai package required for openai mode. Install with 'pip install openai'.")
         else:
-            if mode_diff == 'other':
-                self._init_offline_model()
-            elif mode_diff == 'openai':
-                if openai is None:
-                    raise ImportError("openai package is required for openai mode. Please install it with 'pip install openai'.")
-                # No further init needed for openai
-                pass
-            else:
+            if self.server_url:
                 self.server_url = self.server_url + mode_diff
-                self._test_server_status()
+            self._test_server_status()
 
-    def _init_offline_model(self):
-        """
-        Initialize offline model with quantization support
-        """
-        # Create a copy of server_params to avoid modifying the original
+    def _init_offline_model(self) -> None:
+        """Initialize offline model with quantization support."""
         sgl_params = dict(self.server_params)
-        
-        # Check if we should use transformers fallback
         use_transformers_fallback = sgl_params.pop('use_transformers_fallback', False)
-        quantization = sgl_params.get('quantization', None)
+        quantization = sgl_params.get('quantization')
         
-        # Map user-friendly quantization names to SGLang-compatible ones
         quantization_mapping = {
-            'int8': 'blockwise_int8',  # Map int8 to blockwise_int8 for SGLang
-            'int4': 'bitsandbytes',    # Map int4 to bitsandbytes for SGLang  
+            'int8': 'blockwise_int8',
+            'int4': 'bitsandbytes',
             'blockwise_int8': 'blockwise_int8',
             'bitsandbytes': 'bitsandbytes',
             'fp8': 'fp8',
@@ -79,63 +96,52 @@ class GeneratorMixin:
         }
         
         if use_transformers_fallback:
-            print("Using transformers fallback as requested...")
+            logger.info("Using transformers fallback as requested...")
             self._init_transformers_pipeline()
-        else:
-            # Map quantization to SGLang-compatible format
-            if quantization and quantization in quantization_mapping:
-                sgl_params['quantization'] = quantization_mapping[quantization]
-                print(f"Mapping quantization '{quantization}' to '{quantization_mapping[quantization]}' for SGLang")
-                
-                # Add required parameters for specific quantization methods
-                if quantization_mapping[quantization] == 'blockwise_int8':
-                    if 'weight_block_size' not in sgl_params:
-                        sgl_params['weight_block_size'] = 128  # Default block size
-                        print(f"Setting default weight_block_size=128 for blockwise_int8")
-                        
-            elif quantization:
-                print(f"Using quantization '{quantization}' directly for SGLang")
-                
-                # Add required parameters for blockwise_int8 if used directly
-                if quantization == 'blockwise_int8' and 'weight_block_size' not in sgl_params:
-                    sgl_params['weight_block_size'] = 128  # Default block size
-                    print(f"Setting default weight_block_size=128 for blockwise_int8")
+            return
+        
+        # Map quantization to SGLang-compatible format
+        if quantization and quantization in quantization_mapping:
+            sgl_params['quantization'] = quantization_mapping[quantization]
+            logger.info(f"Mapping quantization '{quantization}' to '{quantization_mapping[quantization]}' for SGLang")
             
-            try:
-                # Set up SGLang engine with quantization support
-                self.llm = sgl.Engine(
-                    model_path=self.model_name_or_path,
-                    **sgl_params
-                )
-                print(f"SGLang engine initialized successfully with quantization: {sgl_params.get('quantization', 'none')}")
-            except Exception as e:
-                print(f"SGLang initialization failed: {e}")
-                print("Falling back to transformers with quantization...")
-                self._init_transformers_pipeline()
+            # Add required parameters for specific quantization methods
+            if quantization_mapping[quantization] == 'blockwise_int8':
+                if 'weight_block_size' not in sgl_params:
+                    sgl_params['weight_block_size'] = 128
+                    logger.info("Setting default weight_block_size=128 for blockwise_int8")
+        elif quantization:
+            logger.info(f"Using quantization '{quantization}' directly for SGLang")
+            if quantization == 'blockwise_int8' and 'weight_block_size' not in sgl_params:
+                sgl_params['weight_block_size'] = 128
+                logger.info("Setting default weight_block_size=128 for blockwise_int8")
+        
+        try:
+            self.llm = sgl.Engine(model_path=self.model_name_or_path, **sgl_params)
+            logger.info(f"SGLang engine initialized successfully with quantization: {sgl_params.get('quantization', 'none')}")
+        except Exception as e:
+            logger.warning(f"SGLang initialization failed: {e}")
+            logger.info("Falling back to transformers with quantization...")
+            self._init_transformers_pipeline()
 
-    def _init_transformers_pipeline(self):
-        """
-        Initialize transformers pipeline with BitsAndBytes quantization
-        """
+    def _init_transformers_pipeline(self) -> None:
+        """Initialize transformers pipeline with BitsAndBytes quantization."""
         try:
             from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
             import torch
             
-            # Check if int8 quantization is requested
-            quantization_type = self.server_params.get('quantization', None)
+            quantization_type = self.server_params.get('quantization')
             llm_int8_enable_fp32_cpu_offload = self.server_params.get('llm_int8_enable_fp32_cpu_offload', False)
             
             if quantization_type == 'int8':
-                # Configure BitsAndBytes for int8 quantization, CPU offload from config
                 bnb_config = BitsAndBytesConfig(
                     load_in_8bit=True,
                     llm_int8_threshold=6.0,
                     llm_int8_has_fp16_weight=False,
                     llm_int8_enable_fp32_cpu_offload=llm_int8_enable_fp32_cpu_offload,
                 )
-                print(f"Loading model with int8 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
+                logger.info(f"Loading model with int8 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
             elif quantization_type == 'int4':
-                # Configure BitsAndBytes for int4 quantization, CPU offload from config
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.float16,
@@ -143,10 +149,10 @@ class GeneratorMixin:
                     bnb_4bit_quant_type="nf4",
                     llm_int8_enable_fp32_cpu_offload=llm_int8_enable_fp32_cpu_offload
                 )
-                print(f"Loading model with int4 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
+                logger.info(f"Loading model with int4 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
             else:
                 bnb_config = None
-                print("Loading model without quantization...")
+                logger.info("Loading model without quantization...")
 
             # Load tokenizer and model
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
@@ -154,13 +160,8 @@ class GeneratorMixin:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
             # Determine device map based on quantization
-            if quantization_type == 'int8':
-                # Use more conservative device mapping for int8 with CPU offload
-                device_map = "auto"
-                max_memory = {0: "15GB"}  # Reserve some GPU memory
-            else:
-                device_map = "auto"
-                max_memory = None
+            device_map = "auto"
+            max_memory = {0: "15GB"} if quantization_type == 'int8' else None
             
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name_or_path,
@@ -169,51 +170,67 @@ class GeneratorMixin:
                 max_memory=max_memory,
                 torch_dtype=torch.float16 if bnb_config is None else None,
                 trust_remote_code=True,
-                low_cpu_mem_usage=True  # Reduce CPU memory usage during loading
+                low_cpu_mem_usage=True
             )
             
             self.use_transformers = True
-            print(f"Model loaded successfully with transformers. Memory usage reduced with quantization: {quantization_type}")
+            logger.info(f"Model loaded successfully with transformers. Memory usage reduced with quantization: {quantization_type}")
             
         except ImportError as e:
-            print(f"BitsAndBytes not available: {e}")
-            print("Please install bitsandbytes: pip install bitsandbytes")
+            logger.error(f"BitsAndBytes not available: {e}")
+            logger.error("Please install bitsandbytes: pip install bitsandbytes")
             raise
         except Exception as e:
-            print(f"Transformers initialization failed: {e}")
+            logger.error(f"Transformers initialization failed: {e}")
             raise
 
-    def _test_server_status(self):
-        """
-        Test the status of the server
-        This method can be overidden in subclasses for custom behavior
-        Need to be implemented later
-        """
-        # TODO
+    def _test_server_status(self) -> None:
+        """Test the status of the server. To be implemented in subclasses."""
+        # TODO: Implement server status testing
         pass
 
-    def generate(self, prompts, sampling_params={}):
+    def generate(
+        self, 
+        prompts: Union[List[str], List[Dict[str, Any]]], 
+        sampling_params: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, str]]:
+        """
+        Generate responses for the given prompts.
+        
+        Args:
+            prompts: List of prompts (strings or message dicts).
+            sampling_params: Optional generation parameters.
+            
+        Returns:
+            List of response dicts with 'text' key.
+        """
+        sampling_params = sampling_params or {}
+        
         if hasattr(self, 'use_transformers') and self.use_transformers:
-            return self._generate_transformers(prompts, sampling_params)
+            return self._generate_transformers(cast(List[str], prompts), sampling_params)
         elif self.mode == 'offline':
-            return self._generate_offline(prompts, sampling_params)
+            return self._generate_offline(cast(List[str], prompts), sampling_params)
         elif self.mode == 'localhost':
-            return self._generate_localhost(prompts, sampling_params)
+            return self._generate_localhost(cast(List[str], prompts), sampling_params)
         elif self.mode == 'proxy':
-            return self._generate_proxy(prompts, sampling_params)
+            return self._generate_proxy(cast(List[str], prompts), sampling_params)
         elif self.mode == 'openai':
-            return self._generate_openai(prompts, sampling_params)
+            return self._generate_openai(cast(List[Dict[str, Any]], prompts), sampling_params)
+        else:
+            raise ValueError(f"Unsupported mode: {self.mode}")
 
-    def _generate_transformers(self, prompts, sampling_params={}):
-        """
-        Generate responses using transformers with quantization
-        """
+    def _generate_transformers(
+        self, 
+        prompts: List[str], 
+        sampling_params: Dict[str, Any]
+    ) -> List[Dict[str, str]]:
+        """Generate responses using transformers with quantization."""
         import torch
         from tqdm import tqdm
         
         outputs = []
         batch_size = 1  # Process one at a time to minimize memory usage
-        print(f"🤖 Processing {len(prompts)} prompts with transformers + quantization (batch_size={batch_size})...")
+        logger.info(f"Processing {len(prompts)} prompts with transformers + quantization (batch_size={batch_size})...")
         
         # Clear cache before starting
         torch.cuda.empty_cache()
@@ -229,7 +246,7 @@ class GeneratorMixin:
                 return_tensors="pt", 
                 padding=True, 
                 truncation=True,
-                max_length=1024  # Reduced max length to save memory
+                max_length=1024
             )
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
             
@@ -237,24 +254,23 @@ class GeneratorMixin:
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     **inputs,
-                    max_new_tokens=min(sampling_params.get('max_new_tokens', 512), 256),  # Limit new tokens
+                    max_new_tokens=min(sampling_params.get('max_new_tokens', 512), 256),
                     temperature=sampling_params.get('temperature', 0.6),
                     top_p=sampling_params.get('top_p', 0.95),
                     do_sample=True,
                     pad_token_id=self.tokenizer.eos_token_id,
                     repetition_penalty=sampling_params.get('repetition_penalty', 1.0),
-                    use_cache=False  # Disable cache to save memory
+                    use_cache=False
                 )
             
             # Decode batch results
             for i in range(len(batch_prompts)):
-                # Decode only the new tokens
                 input_length = len(inputs['input_ids'][i])
                 new_tokens = generated_ids[i][input_length:]
                 generated_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
                 outputs.append({"text": generated_text})
             
-            # Aggressive memory cleanup after each batch
+            # Memory cleanup
             del inputs, generated_ids
             torch.cuda.empty_cache()
             
@@ -263,25 +279,26 @@ class GeneratorMixin:
                 import gc
                 gc.collect()
         
-        print(f"✅ Completed {len(outputs)} generations")
+        logger.info(f"Completed {len(outputs)} generations")
         return outputs
         
-    def _generate_offline(self, prompts, sampling_params={}):
-        """
-        Generate responses for the given prompts using the specified model in offline mode.
-        prompts: list of prompts to send to the LLMs
-        sampling_params: Optional parameters for sampling
-        return a JSON response from the LLM API
-        """
+    def _generate_offline(
+        self, 
+        prompts: List[str], 
+        sampling_params: Dict[str, Any]
+    ) -> List[Dict[str, str]]:
+        """Generate responses using SGLang engine in offline mode."""
         return self.llm.generate(prompts, sampling_params=sampling_params)
     
-    def _generate_localhost(self, prompts, sampling_params={}):
-        """
-        Generate responses for the given prompts using the specified model in localhost mode.
-        prompts: list of prompts to send to the LLMs
-        sampling_params: Optional parameters for sampling
-        return a JSON response from the LLM API
-        """
+    def _generate_localhost(
+        self, 
+        prompts: List[str], 
+        sampling_params: Dict[str, Any]
+    ) -> List[Dict[str, str]]:
+        """Generate responses using localhost server."""
+        if not self.server_url:
+            raise ValueError("server_url is required for localhost mode")
+        
         payload = {
             "text": prompts,
             "sampling_params": sampling_params
@@ -289,53 +306,61 @@ class GeneratorMixin:
         response = requests.post(self.server_url, json=payload)
         return response.json()
     
-    def _generate_proxy(self, prompts, sampling_params={}):
-        """
-        Generate responses for the given prompts using the specified model in proxy mode.
-        prompts: list of prompts to send to the LLMs
-        sampling_params: Optional parameters for sampling
-        return a JSON response from the LLM API
-        """
-        # resove openai and sglang parameter naming difference
-        sampling_params['max_tokens'] = sampling_params.pop('max_new_tokens', None)
-        sampling_params.pop("no_stop_trim", None)
-        sampling_params.pop('repetition_penalty', None)
+    def _generate_proxy(
+        self, 
+        prompts: List[str], 
+        sampling_params: Dict[str, Any]
+    ) -> List[Dict[str, str]]:
+        """Generate responses using proxy server."""
+        if not self.server_url:
+            raise ValueError("server_url is required for proxy mode")
+        
+        # Resolve OpenAI and SGLang parameter naming differences
+        proxy_params = dict(sampling_params)
+        proxy_params['max_tokens'] = proxy_params.pop('max_new_tokens', None)
+        proxy_params.pop("no_stop_trim", None)
+        proxy_params.pop('repetition_penalty', None)
 
         payload = {
             "prompts": prompts,
             "model": self.model_name_or_path,
-            "sampling_params": sampling_params
+            "sampling_params": proxy_params
         }
         response = requests.post(self.server_url, json=payload)
-        response = response.json()
-        for out in response:
+        response_data = response.json()
+        for out in response_data:
             out['text'] = out['text'].strip()
-        return response
+        return response_data
     
-    def _generate_openai(self, prompts, sampling_params={}):
-        """
-        Generate responses using the OpenAI API (chat/completions endpoint).
-        prompts: list of messages (OpenAI chat format)
-        sampling_params: dict of OpenAI parameters (e.g., temperature, max_tokens)
-        """
+    def _generate_openai(
+        self, 
+        prompts: List[Dict[str, Any]], 
+        sampling_params: Dict[str, Any]
+    ) -> List[Dict[str, str]]:
+        """Generate responses using OpenAI API."""
         api_key = os.environ.get("OPENAI_API_KEY", self.server_params.get("api_key"))
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable or api_key in server_params must be set for openai mode.")
+        
         import openai as _openai
         _openai.api_key = api_key
         model = self.model_name_or_path or self.server_params.get("model", "gpt-4o")
         results = []
+        
         for messages in prompts:
             # Ensure messages is a list of dicts for OpenAI API
             if isinstance(messages, dict):
                 messages = [messages]
+            
             # Map max_new_tokens to max_tokens for OpenAI API
             params = {k: v for k, v in sampling_params.items() if v is not None}
             if "max_new_tokens" in params:
                 params["max_tokens"] = params.pop("max_new_tokens")
-            # Remove any other unsupported keys
+            
+            # Remove unsupported keys
             for unsupported in ["no_stop_trim", "repetition_penalty", "stop"]:
                 params.pop(unsupported, None)
+            
             response = _openai.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -343,14 +368,11 @@ class GeneratorMixin:
             )
             text = response.choices[0].message.content
             results.append({"text": text})
+        
         return results
     
-    def shutdown(self):
-        """
-        Shutdown the generator
-        This method can be overidden in subclasses for custom behavior
-        Need to be implemented later
-        """
+    def shutdown(self) -> None:
+        """Shutdown the generator and clean up resources."""
         if self.mode == 'offline':
             if hasattr(self, 'use_transformers') and self.use_transformers:
                 # Clean up transformers model
@@ -363,17 +385,20 @@ class GeneratorMixin:
             elif hasattr(self, 'llm'):
                 self.llm.shutdown()
     
-    def _fix_stop_word(self, text):
+    def _fix_stop_word(self, text: str) -> str:
         """
-        Fix missing stop words in text generated by the API
-
-        When stop words are used as stopping criteria, the API often trims them from the repsponse. This function detects the most recently opend unclosed tag and add the stop word to the end of the text.
-        (<search> or <answer>) and appends the corresponding closing tag.
-
-        text: The generated text with potentially missing closing tags.
-        return Text with appropriate clossing tag added if needed.
+        Fix missing stop words in text generated by the API.
+        
+        When stop words are used as stopping criteria, the API often trims them from the response.
+        This function detects the most recently opened unclosed tag and adds the stop word to the end.
+        
+        Args:
+            text: The generated text with potentially missing closing tags.
+            
+        Returns:
+            Text with appropriate closing tag added if needed.
         """
-        #Find last occurence of each opening tag
+        # Find last occurrence of each opening tag
         last_search_open = text.rfind('<search>')
         last_answer_open = text.rfind('<answer>')
 
@@ -383,13 +408,14 @@ class GeneratorMixin:
     
         # Determine which tag was opened most recently
         if last_search_open > last_answer_open:
-            # check if the tag is already a closing tag after the last opening tag
+            # Check if the tag is already closed after the last opening tag
             if text.find('</search>', last_search_open) == -1:
-                # if not, add the closing tag
+                # If not, add the closing tag
                 text = text[:last_search_open] + '</search>' + text[last_search_open:]
         else:
-            # check if the tag is already a closing tag after the last opening tag
+            # Check if the tag is already closed after the last opening tag
             if text.find('</answer>', last_answer_open) == -1:
-                # if not, add the closing tag
+                # If not, add the closing tag
                 text = text[:last_answer_open] + '</answer>' + text[last_answer_open:]
+        
         return text
