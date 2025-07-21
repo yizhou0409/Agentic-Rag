@@ -585,26 +585,43 @@ def main(cfg: Any) -> None:
                 search_queries, search_results, summarizer_user_message_template, 
                 None, cfg, summarizer_tokenizer
             )
-            # --- FIX: ensure summarizer_prompt_list is always a list of strings ---
-            def extract_prompt_str(prompt):
-                if isinstance(prompt, dict) and 'prompt' in prompt:
-                    return prompt['prompt']
-                elif isinstance(prompt, str):
-                    return prompt
-                elif isinstance(prompt, list):
-                    # If it's a list of dicts or strings, recursively extract
-                    return [extract_prompt_str(p) for p in prompt]
+            # --- FIX: ensure summarizer_prompt_list is always correct for OpenAI/local modes ---
+            use_openai_summarizer = cfg.model.summarizer_mode in ["openai", "proxy"]
+            if use_openai_summarizer:
+                # summarizer_prompt is a list of message dicts or a single message list
+                if isinstance(summarizer_prompt, list) and all(isinstance(x, dict) and 'role' in x and 'content' in x for x in summarizer_prompt):
+                    summarizer_prompt_list = [summarizer_prompt]
+                elif isinstance(summarizer_prompt, list) and all(isinstance(x, list) for x in summarizer_prompt):
+                    summarizer_prompt_list = summarizer_prompt
                 else:
-                    raise ValueError(f"Unexpected prompt type: {type(prompt)}")
-
-            summarizer_prompt_strs = extract_prompt_str(summarizer_prompt)
-            # Flatten if nested list
-            if isinstance(summarizer_prompt_strs, list) and any(isinstance(x, list) for x in summarizer_prompt_strs):
-                summarizer_prompt_list = [item for sublist in summarizer_prompt_strs for item in (sublist if isinstance(sublist, list) else [sublist])]
-            elif isinstance(summarizer_prompt_strs, list):
-                summarizer_prompt_list = summarizer_prompt_strs
+                    summarizer_prompt_list = [summarizer_prompt]
             else:
-                summarizer_prompt_list = [summarizer_prompt_strs]
+                def extract_prompt_str(prompt):
+                    if isinstance(prompt, dict):
+                        if 'prompt' in prompt:
+                            return prompt['prompt']
+                        elif 'messages' in prompt:
+                            # Join all message contents as a single string
+                            return "\n".join([extract_prompt_str(m) for m in prompt["messages"]])
+                        elif set(prompt.keys()) == {'role', 'content'}:
+                            return prompt['content']
+                        else:
+                            raise ValueError(f"Unexpected dict keys in prompt: {prompt.keys()}")
+                    elif isinstance(prompt, str):
+                        return prompt
+                    elif isinstance(prompt, list):
+                        # If it's a list of dicts or strings, recursively extract
+                        return [extract_prompt_str(p) for p in prompt]
+                    else:
+                        raise ValueError(f"Unexpected prompt type: {type(prompt)}")
+                summarizer_prompt_strs = extract_prompt_str(summarizer_prompt)
+                # Flatten if nested list
+                if isinstance(summarizer_prompt_strs, list) and any(isinstance(x, list) for x in summarizer_prompt_strs):
+                    summarizer_prompt_list = [item for sublist in summarizer_prompt_strs for item in (sublist if isinstance(sublist, list) else [sublist])]
+                elif isinstance(summarizer_prompt_strs, list):
+                    summarizer_prompt_list = summarizer_prompt_strs
+                else:
+                    summarizer_prompt_list = [summarizer_prompt_strs]
             summarizer_output = summarizer_model.generate(summarizer_prompt_list, summarizer_sampling_params)
             summary_outputs = [parse_summary_generation(out["text"]) for out in summarizer_output]
             
