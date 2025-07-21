@@ -70,18 +70,19 @@ def reformat_for_supervised(inference_output_path, supervised_out_path, dataset_
         data = json.load(fin)
     with open(supervised_out_path, 'w', encoding='utf-8') as fout:
         for item in data:
-            if dataset_name == "2wikimultihop":
-                question = item.get("text")
-                answer = item.get("metadata", {}).get("answer", [])
-                if isinstance(answer, list):
-                    answer = "; ".join(answer)
+            # The format from rar_inference.py is unified.
+            question = item.get("question")
+            # The 'answer' for training should be the ground truth from the 'gold' field.
+            gold_answer = item.get("gold", [])
+            if isinstance(gold_answer, list):
+                answer_str = "; ".join(gold_answer)
             else:
-                question = item.get("question")
-                answer = item.get("answer")
+                answer_str = gold_answer if gold_answer is not None else ""
+
             out = {
                 "question": question,
-                "trajectory": item.get("output"),  # or adjust to the correct field
-                "answer": answer,
+                "trajectory": item.get("output"),
+                "answer": answer_str,
             }
             fout.write(json.dumps(out, ensure_ascii=False) + "\n")
     print(f"Saved {len(data)} items to {supervised_out_path}")
