@@ -78,9 +78,9 @@ class TrajectoryDataset(Dataset):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a model on trajectory data")
-    parser.add_argument("--model_path", type=str, default="/scratch/yl9038/models/qwen3",
+    parser.add_argument("--model_path", type=str, default="/scratch/yl9038/models/Qwen3-0.6B",
                        help="Path to the pretrained model")
-    parser.add_argument("--data_paths", type=str, nargs="+", required=True,
+    parser.add_argument("--data_paths", type=str, nargs="+",default=,
                        help="Paths to the trajectory data files")
     parser.add_argument("--output_dir", type=str, default="./output/sft_checkpoints",
                        help="Directory to save the model checkpoints")
