@@ -2,7 +2,6 @@ data/hotpotqa/train.jsonl
 *.err
 *.out
 indexes/
-data/
 output/
 outputs/
 __pycache__/
