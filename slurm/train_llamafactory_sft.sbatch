@@ -38,29 +38,29 @@ torchrun --nproc_per_node=4 src/train.py \
     --trust_remote_code \
     --stage sft \
     --do_train \
-    --finetuning_type lora \
-    --lora_rank 8 \
-    --lora_target all \
+    --finetuning_type full \
     --dataset 2wikimultihop_alpaca,hotpotqa_alpaca \
-    --template qwen \
+    --dataset_dir LLaMA-Factory/data \
+    --template default \
     --cutoff_len 2048 \
-    --max_samples 200 \
+    --max_samples 100000 \
     --overwrite_cache \
     --preprocessing_num_workers 4 \
     --dataloader_num_workers 2 \
-    --output_dir saves/qwen3-8b/lora/2wikimultihop \
-    --logging_steps 10 \
+    --output_dir saves/qwen3-8b/full/2wikimultihop_hotpotqa \
+    --logging_steps 5 \
     --save_steps 100 \
     --plot_loss \
     --overwrite_output_dir \
     --save_only_model \
     --report_to none \
-    --per_device_train_batch_size 1 \
+    --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 8 \
-    --learning_rate 2.0e-4 \
-    --num_train_epochs 3.0 \
+    --learning_rate 5e-5 \
+    --num_train_epochs 10.0 \
     --lr_scheduler_type cosine \
-    --warmup_ratio 0.1 \
+    --max_grad_norm 1.0 \
+    --warmup_steps 50 \
     --bf16 \
     --ddp_timeout 180000000 \
     --gradient_checkpointing \
