@@ -17,6 +17,11 @@ module load cuda/12.4.1-gcc-10.1.0
 source /gpfsnyu/scratch/yl9038/anaconda3/etc/profile.d/conda.sh
 conda activate llama-train
 
+# Ensure dataset_info.json is present and print its contents
+echo "Checking dataset_info.json on compute node:"
+ls -l LLaMA-Factory/data/dataset_info.json || cp /gpfsnyu/scratch/yl9038/longcot-rag-inference/LLaMA-Factory/data/dataset_info.json LLaMA-Factory/data/dataset_info.json
+cat LLaMA-Factory/data/dataset_info.json | head -20
+
 # Set environment variables for distributed training
 export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=1
@@ -29,11 +34,10 @@ echo "Working directory: $(pwd)"
 nvidia-smi
 
 # Navigate to LLaMA-Factory directory
-cd LLaMA-Factory
 
 # Run the LLaMA-Factory training using CLI with torchrun
 echo "Starting LLaMA-Factory training..."
-torchrun --nproc_per_node=4 src/train.py \
+torchrun --nproc_per_node=4 LLaMA-Factory/src/train.py \
     --model_name_or_path /scratch/yl9038/models/Qwen3-8B \
     --trust_remote_code \
     --stage sft \
@@ -64,7 +68,7 @@ torchrun --nproc_per_node=4 src/train.py \
     --bf16 \
     --ddp_timeout 180000000 \
     --gradient_checkpointing \
-    --deepspeed examples/deepspeed/ds_z3_config.json \
+    --deepspeed LLaMA-Factory/examples/deepspeed/ds_z3_config.json \
     --ddp_backend nccl \
     --ddp_find_unused_parameters false \
     --prompt_template_path /gpfsnyu/scratch/yl9038/longcot-rag-inference/prompts/default_QA.yaml

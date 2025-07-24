@@ -15,6 +15,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
+import re
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
@@ -67,10 +68,27 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             else:
                 source_label = [IGNORE_INDEX] * source_len
 
+            # --- Begin masking <information>...</information> in response ---
+            target_label = target_ids.copy()
+            if len(response) > 0 and "content" in response[0]:
+                resp_text = response[0]["content"]
+                info_spans = [(m.start(1), m.end(1)) for m in re.finditer(r"<information>(.*?)</information>", resp_text, re.DOTALL)]
+                if info_spans:
+                    resp_tokens = self.tokenizer(resp_text, add_special_tokens=False)
+                    char_to_token = []
+                    idx = 0
+                    for token in resp_tokens.encodings[0].offsets:
+                        # token: (start_char, end_char)
+                        char_to_token.append((token[0], token[1]))
+                    for span_start, span_end in info_spans:
+                        for i, (tok_start, tok_end) in enumerate(char_to_token):
+                            if tok_start >= span_start and tok_end <= span_end:
+                                if i < len(target_label):
+                                    target_label[i] = IGNORE_INDEX
+            # --- End masking ---
+
             if self.data_args.mask_history and turn_idx != 0:  # train on the last turn only
                 target_label = [IGNORE_INDEX] * target_len
-            else:
-                target_label = target_ids
 
             if self.data_args.mask_history:  # reversed sequences
                 input_ids = source_ids + target_ids + input_ids
