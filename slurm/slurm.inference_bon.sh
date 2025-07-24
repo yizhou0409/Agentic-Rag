@@ -4,8 +4,9 @@
 #SBATCH --job-name=rar
 #SBATCH --output=/scratch/bc3088/longcot-rag/log/%x_%j.out
 #SBATCH --error=/scratch/bc3088/longcot-rag/log/%x_%j.err
-#SBATCH --time=15:00:00
-#SBATCH --gres=gpu:2
+#SBATCH --time=48:00:00
+#SBATCH --gres=gpu:h20:2
+#SBATCH --partition=sfscai
 #SBATCH --mem=128G
 #SBATCH --requeue
 
