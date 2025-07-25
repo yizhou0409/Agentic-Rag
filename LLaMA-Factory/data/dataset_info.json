@@ -724,8 +724,8 @@
       "response": "output"
     }
   },
-  "2wikimultihop_alpaca": {
-    "file_name": "2wikimultihop_alpaca.json",
+  "2wikimultihop_baseline_alpaca": {
+    "file_name": "2wikimultihop_baseline_alpaca.json",
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
@@ -733,8 +733,26 @@
       "response": "output"
     }
   },
-  "hotpotqa_alpaca": {
-    "file_name": "hotpotqa_alpaca.json",
+  "hotpotqa_baseline_alpaca": {
+    "file_name": "hotpotqa_baseline_alpaca.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "2wikimultihop_teacher_alpaca": {
+    "file_name": "2wikimultihop_teacher_alpaca.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "hotpotqa_teacher_alpaca": {
+    "file_name": "hotpotqa_teacher_alpaca.json",
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
