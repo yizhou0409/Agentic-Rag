@@ -8,3 +8,5 @@ __pycache__/
 FlashRAG/
 bm25/
 configs/
+trained_baseline_models/
+trained_teacher_models/
