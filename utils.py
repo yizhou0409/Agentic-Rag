@@ -80,23 +80,38 @@ def parse_reasoning_generation(response: str) -> Tuple[str, Optional[str], Optio
     if not isinstance(response, str):
         raise ValueError(f"Response must be a string, got {type(response)}")
     
-    # Use regex to find <search> or <answer> tags and extract content
-    pattern = r"(.*?)<(search|answer)>(.*?)</\2>"
-    match = re.search(pattern, response, re.DOTALL)
+    # Find the last <answer> tag to get the final answer
+    answer_pattern = r"<answer>(.*?)</answer>"
+    answer_matches = list(re.finditer(answer_pattern, response, re.DOTALL))
     
-    if not match:
-        return response, None, None
+    if answer_matches:
+        # Get the last answer
+        last_answer_match = answer_matches[-1]
+        answer = last_answer_match.group(1).strip()
+        
+        # Get the thought part before the last answer
+        thought_end = last_answer_match.start()
+        thought = response[:thought_end].strip()
+        
+        return thought, None, answer
     
-    thought = match.group(1).strip()
-    content = match.group(3).strip()
-    action = match.group(2)
+    # If no answer tag found, look for search tags
+    search_pattern = r"<search>(.*?)</search>"
+    search_matches = list(re.finditer(search_pattern, response, re.DOTALL))
     
-    if action == 'search':
-        return thought, content, None
-    elif action == 'answer':
-        return thought, None, content
-    else:
-        raise ValueError(f"Invalid action type: {action}")
+    if search_matches:
+        # Get the last search
+        last_search_match = search_matches[-1]
+        search_query = last_search_match.group(1).strip()
+        
+        # Get the thought part before the last search
+        thought_end = last_search_match.start()
+        thought = response[:thought_end].strip()
+        
+        return thought, search_query, None
+    
+    # If no tags found, return the whole response as thought
+    return response, None, None
 
 def parse_summary_generation(response: str) -> Tuple[str, str]:
     """
@@ -221,10 +236,24 @@ def extract_reasoning_and_answer(response: str, llm_path: str) -> Tuple[str, str
         answer_output = answer_match.group(1).strip() if answer_match else ""
         
     elif "qwen" in llm_path_lower or "qwq" in llm_path_lower:
-        reasoning_match = re.search(r'(.*?)</think>', response, re.DOTALL)
-        reasoning_output = reasoning_match.group(1).strip() if reasoning_match else response
-        answer_match = re.search(r'Final Answer:\s*(.*)', response, re.DOTALL)
-        answer_output = answer_match.group(1).strip() if answer_match else ""
+        # Extract reasoning (everything before the last <answer> tag)
+        answer_pattern = r"<answer>(.*?)</answer>"
+        answer_matches = list(re.finditer(answer_pattern, response, re.DOTALL))
+        
+        if answer_matches:
+            # Get the last answer
+            last_answer_match = answer_matches[-1]
+            answer_output = last_answer_match.group(1).strip()
+            
+            # Get the reasoning part before the last answer
+            reasoning_end = last_answer_match.start()
+            reasoning_output = response[:reasoning_end].strip()
+        else:
+            # Fallback to old format
+            reasoning_match = re.search(r'(.*?)</think>', response, re.DOTALL)
+            reasoning_output = reasoning_match.group(1).strip() if reasoning_match else response
+            answer_match = re.search(r'Final Answer:\s*(.*)', response, re.DOTALL)
+            answer_output = answer_match.group(1).strip() if answer_match else ""
         
     else:
         raise ValueError(f"Unsupported LLM path: {llm_path}")
