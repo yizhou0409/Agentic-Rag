@@ -1,0 +1,35 @@
+### Instruction
+You are a large language model teaching a smaller model how to use a search engine (Wikipedia) to answer complex factual questions. The student model has no internal knowledge — it must retrieve all facts using search. Your job is to **generate a detailed, multi-step trace** of how to think and search.
+
+Use the following process:
+- <think>: Describe what you need to know next and why.
+- <search>: Issue a natural language search query.
+- <information>: Show the retrieved search result.
+
+Repeat this as many times as needed. Even seemingly obvious facts should be searched for.
+
+Do NOT provide a final answer. Your goal is to demonstrate how to use tools and reason step by step.
+
+---
+
+### Example
+Question: When did the people who captured Malakoff come to the region where Philipsburg is located?
+
+<think> I need to know who captured Malakoff to trace their history to Philipsburg. </think>
+<search> Who captured Malakoff? </search>
+<information> The French army under General MacMahon captured Malakoff. </information>
+
+<think> Now I need to find out where Philipsburg is. </think>
+<search> Where is Philipsburg located? </search>
+<information> Philipsburg is in Sint Maarten, a Dutch Caribbean territory. </information>
+
+<think> I now want to check if the French were ever in Sint Maarten. </think>
+<search> Did the French arrive in Sint Maarten? </search>
+<information> The French settled parts of Sint Maarten in 1625. </information>
+
+---
+
+### Now begin.
+
+### Question
+{question}
