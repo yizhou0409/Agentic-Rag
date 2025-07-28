@@ -23,8 +23,6 @@ The RAR pipeline works as follows:
 - `rar_inference.py`: Main script for running the RAR pipeline.
 - `configs/inference.yaml`: Configuration file for inference (dataset, model, retrieval, etc).
 - `FlashRAG/`: FlashRAG toolkit for retrieval.
-- `data/`: Datasets for inference and training.
-- `trained_baseline_models/`, `trained_teacher_models/`: Directories for storing trained models.
 
 ### How to Run RAR Inference
 
@@ -32,6 +30,7 @@ The RAR pipeline works as follows:
    ```bash
    pip install -r requirements.txt
    ```
+   - Otherwise you may refer to environment.yaml
 
 2. **Prepare the retrieval index and corpus:**
    - Make sure your retrieval index (e.g., BM25 or FAISS) and corpus are built and paths are set in `configs/inference.yaml` under `retrieval.flashrag_config`.
@@ -81,38 +80,7 @@ The RAR pipeline works as follows:
   - `LLaMA-Factory/data/hotpotqa_teacher_alpaca.json`
 - All datasets are registered in `LLaMA-Factory/data/dataset_info.json`.
 
-### How to Run SFT Training
-
-1. **Edit the dataset line in your SLURM script (`slurm/train_sft.sh`):**
-   - For baseline data:
-     ```bash
-     --dataset 2wikimultihop_baseline_alpaca,hotpotqa_baseline_alpaca \
-     ```
-   - For teacher trajectory data:
-     ```bash
-     --dataset 2wikimultihop_teacher_alpaca,hotpotqa_teacher_alpaca \
-     ```
-
-2. **Submit the training job:**
-   ```bash
-   sbatch slurm/train_sft.sh
-   ```
-
-3. **Trained models will be saved in the directory specified by `--output_dir`.**
-
----
-
-## 3. FlashRAG Retrieval
-
-- The codebase uses [FlashRAG](https://github.com/RUC-NLPIR/FlashRAG) for efficient document retrieval.
-- You can configure retrieval methods (BM25, dense, etc.) and index/corpus paths in `configs/inference.yaml`.
-
----
-
-## 4. Requirements
-
-- Python 3.10+
-- See `requirements.txt` for all dependencies.
+This project uses [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) for supervised fine-tuning (SFT) of language models. LLaMA-Factory provides a comprehensive framework for training, evaluation, and deployment of large language models.
 
 ---
 
