@@ -16,12 +16,8 @@ import argparse
 from train_consistency_head import ConsistencyHead, ModelWithConsistencyHead
 
 def load_trained_model(model_path: str, consistency_head_path: str, 
-                      config_path: str, use_quantization: bool = True):
-    """Load the trained model with consistency head."""
-    
-    # Load configuration
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+                      use_quantization: bool = True):
+    """Load the base model and add consistency head manually."""
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -50,9 +46,18 @@ def load_trained_model(model_path: str, consistency_head_path: str,
             trust_remote_code=True
         )
     
+    # Get hidden size from base model
+    hidden_size = base_model.config.hidden_size
+    
     # Create and load consistency head
-    consistency_head = ConsistencyHead(config["hidden_size"])
-    consistency_head.load_state_dict(torch.load(consistency_head_path, map_location="cpu"))
+    consistency_head = ConsistencyHead(hidden_size)
+    
+    # Load consistency head weights if they exist
+    if os.path.exists(consistency_head_path):
+        print(f"Loading consistency head from {consistency_head_path}")
+        consistency_head.load_state_dict(torch.load(consistency_head_path, map_location="cpu"))
+    else:
+        print(f"Warning: Consistency head file {consistency_head_path} not found. Using untrained head.")
     
     # Create model with consistency head
     model = ModelWithConsistencyHead(base_model, consistency_head)
@@ -99,8 +104,6 @@ def main():
                        help="Path to base Qwen3-32B model")
     parser.add_argument("--consistency_head_path", type=str, default="./trained_consistency_model/consistency_head.pt",
                        help="Path to trained consistency head")
-    parser.add_argument("--config_path", type=str, default="./trained_consistency_model/config.json",
-                       help="Path to model configuration")
     parser.add_argument("--use_quantization", action="store_true",
                        help="Use 4-bit quantization")
     
@@ -111,7 +114,6 @@ def main():
     model, tokenizer = load_trained_model(
         args.model_path, 
         args.consistency_head_path, 
-        args.config_path, 
         args.use_quantization
     )
     

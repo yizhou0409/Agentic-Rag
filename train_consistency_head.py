@@ -67,6 +67,8 @@ class ConsistencyHead(nn.Module):
         """Forward pass of the consistency head."""
         # Use the last hidden state for classification
         last_hidden = hidden_states[:, -1, :]  # [batch_size, hidden_size]
+        # Convert to float32 to avoid dtype mismatch with quantized models
+        last_hidden = last_hidden.float()
         last_hidden = self.dropout(last_hidden)
         consistency_score = self.classifier(last_hidden)  # [batch_size, 1]
         return consistency_score.squeeze(-1)  # [batch_size]
@@ -116,6 +118,49 @@ class ConsistencyDataset(Dataset):
     def __getitem__(self, idx):
         return self.examples[idx]
 
+def save_training_examples(training_examples: List[ConsistencyTrainingExample], save_path: str) -> None:
+    """Save processed training examples to disk."""
+    logger.info(f"Saving {len(training_examples)} training examples to {save_path}")
+    
+    # Convert to serializable format
+    data_to_save = []
+    for example in training_examples:
+        data_to_save.append({
+            "input_ids": example.input_ids.tolist(),
+            "attention_mask": example.attention_mask.tolist(),
+            "consistency_label": example.consistency_label,
+            "search_query": example.search_query,
+            "search_results": example.search_results,
+            "model_answer": example.model_answer
+        })
+    
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(data_to_save, f, indent=2)
+    
+    logger.info(f"Training examples saved successfully")
+
+def load_training_examples(load_path: str) -> List[ConsistencyTrainingExample]:
+    """Load processed training examples from disk."""
+    logger.info(f"Loading training examples from {load_path}")
+    
+    with open(load_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    training_examples = []
+    for item in data:
+        example = ConsistencyTrainingExample(
+            input_ids=torch.tensor(item["input_ids"], dtype=torch.long),
+            attention_mask=torch.tensor(item["attention_mask"], dtype=torch.long),
+            consistency_label=item["consistency_label"],
+            search_query=item["search_query"],
+            search_results=item["search_results"],
+            model_answer=item["model_answer"]
+        )
+        training_examples.append(example)
+    
+    logger.info(f"Loaded {len(training_examples)} training examples")
+    return training_examples
+
 def load_trajectory_data(trajectory_paths: List[str]) -> List[Dict[str, Any]]:
     """Load pre-generated trajectories from multiple JSONL files."""
     logger.info(f"Loading trajectories from {len(trajectory_paths)} files")
@@ -136,11 +181,11 @@ def load_trajectory_data(trajectory_paths: List[str]) -> List[Dict[str, Any]]:
     return all_trajectories
 
 def extract_search_blocks_and_answers(trajectory: str) -> List[Tuple[str, str, str]]:
-    """Extract search queries, search results, and final answers from trajectory."""
+    """Extract search blocks and their corresponding answers from trajectory."""
     search_blocks = []
     
-    # Find all search blocks
-    search_pattern = r'<search>(.*?)</search>\s*<information>(.*?)</information>'
+    # Find all search blocks: <search>query</search><information>results</information>
+    search_pattern = r'<search>(.*?)</search><information>(.*?)</information>'
     search_matches = re.findall(search_pattern, trajectory, re.DOTALL)
     
     # Find the final answer
@@ -149,108 +194,173 @@ def extract_search_blocks_and_answers(trajectory: str) -> List[Tuple[str, str, s
     final_answer = answer_match.group(1).strip() if answer_match else ""
     
     for search_query, search_results in search_matches:
-        search_query = search_query.strip()
-        search_results = search_results.strip()
-        
-        if search_query and search_results:
-            search_blocks.append((search_query, search_results, final_answer))
+        search_blocks.append((search_query.strip(), search_results.strip(), final_answer))
     
     return search_blocks
 
+def generate_model_answer(model, tokenizer, search_query: str, search_results: str) -> str:
+    """Generate an answer to the search query using the trained model."""
+    # Create prompt for the model to answer the search query
+    prompt = f"""Search Query: {search_query}
+
+Search Results: {search_results}
+
+Based on the search results above, please answer the search query: {search_query}
+
+Answer:"""
+    
+    # Tokenize input
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048,
+        padding=False
+    )
+    
+    # Move to device
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Generate answer
+    model.eval()
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=100,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    # Decode the generated text
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # Extract only the generated part (after the prompt)
+    answer = generated_text[len(prompt):].strip()
+    
+    return answer
+
 def judge_consistency(judge_model, judge_tokenizer, search_query: str, 
                      search_results: str, model_answer: str) -> float:
-    """Use the judging model to determine consistency between search results and model answer."""
+    """Use referee model to judge if model's answer is consistent with search results."""
     
-    prompt = f"""You are a judge that determines whether a model's answer to a search query is consistent with the search results.
-
-Search Query: {search_query}
+    # Create prompt for consistency judgment
+    prompt = f"""Search Query: {search_query}
 
 Search Results: {search_results}
 
 Model's Answer: {model_answer}
 
-Is the model's answer consistent with the search results? Answer with "Yes" or "No".
+Question: Is the model's answer consistent with the search results? Answer with "Yes" or "No".
 
 Answer:"""
     
-    inputs = judge_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    inputs = {k: v.to(judge_model.device) for k, v in inputs.items()}
+    # Tokenize input
+    inputs = judge_tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048,
+        padding=False
+    )
     
+    # Move to device
+    device = next(judge_model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Generate judgment
+    judge_model.eval()
     with torch.no_grad():
         outputs = judge_model.generate(
             **inputs,
             max_new_tokens=10,
-            temperature=0.1,
             do_sample=False,
+            temperature=0.1,
+            top_p=0.95,
+            top_k=20,
             pad_token_id=judge_tokenizer.eos_token_id
         )
     
-    response = judge_tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = response[len(prompt):].strip().lower()
+    # Decode the generated text
+    generated_text = judge_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # Extract only the generated part (after the prompt)
+    judgment = generated_text[len(prompt):].strip().lower()
     
     # Determine consistency score
-    if "yes" in response:
+    if "yes" in judgment:
         return 1.0
-    elif "no" in response:
+    elif "no" in judgment:
         return 0.0
     else:
-        # If unclear, default to 0.5
+        # If unclear, default to 0.5 (uncertain)
         return 0.5
 
 def create_training_examples(trajectories: List[Dict[str, Any]], 
-                           judge_model, judge_tokenizer,
-                           base_tokenizer) -> List[ConsistencyTrainingExample]:
-    """Create training examples from pre-generated trajectories."""
-    logger.info("Creating training examples from trajectories...")
-    
+                           trained_model, trained_tokenizer,
+                           judge_model, judge_tokenizer) -> List[ConsistencyTrainingExample]:
+    """Create training examples by generating answers and judging consistency."""
     training_examples = []
     
-    for trajectory_data in tqdm(trajectories, desc="Processing trajectories"):
-        trajectory = trajectory_data["trajectory"]
+    logger.info(f"Processing {len(trajectories)} trajectories...")
+    
+    for i, trajectory_data in enumerate(tqdm(trajectories, desc="Processing trajectories")):
+        trajectory = trajectory_data.get("trajectory", "")
         
-        # Extract search blocks and answers
+        # Extract search blocks
         search_blocks = extract_search_blocks_and_answers(trajectory)
         
-        for search_query, search_results, model_answer in search_blocks:
-            # Judge consistency
-            consistency_score = judge_consistency(judge_model, judge_tokenizer, 
-                                               search_query, search_results, model_answer)
-            
-            # Create input text for the model
-            input_text = f"""Search Query: {search_query}
+        for search_query, search_results, final_answer in search_blocks:
+            try:
+                # Generate model's answer to this search query
+                model_answer = generate_model_answer(trained_model, trained_tokenizer, search_query, search_results)
+                
+                # Judge consistency using referee model
+                consistency_score = judge_consistency(judge_model, judge_tokenizer, search_query, search_results, model_answer)
+                
+                # Create input text for consistency head training
+                # This should be the context up to the </search> position
+                input_text = f"""Search Query: {search_query}
 
 Search Results: {search_results}
 
 Model's Answer: {model_answer}
 
-Is the model's answer consistent with the search results?"""
-            
-            # Tokenize input
-            inputs = base_tokenizer(
-                input_text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=2048,
-                padding=False  # Don't pad here, we'll pad in collate_fn
-            )
-            
-            # Create training example
-            example = ConsistencyTrainingExample(
-                input_ids=inputs["input_ids"].squeeze(0),
-                attention_mask=inputs["attention_mask"].squeeze(0),
-                consistency_label=consistency_score,
-                search_query=search_query,
-                search_results=search_results,
-                model_answer=model_answer
-            )
-            
-            training_examples.append(example)
+Consistency Score:"""
+                
+                # Tokenize input
+                inputs = trained_tokenizer(
+                    input_text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=2048,
+                    padding=False
+                )
+                
+                # Create training example
+                example = ConsistencyTrainingExample(
+                    input_ids=inputs["input_ids"].squeeze(0),
+                    attention_mask=inputs["attention_mask"].squeeze(0),
+                    consistency_label=consistency_score,
+                    search_query=search_query,
+                    search_results=search_results,
+                    model_answer=model_answer
+                )
+                
+                training_examples.append(example)
+                
+            except Exception as e:
+                logger.warning(f"Error processing search block {i}: {e}")
+                continue
     
     logger.info(f"Created {len(training_examples)} training examples")
     return training_examples
 
 def train_consistency_head(model: ModelWithConsistencyHead, 
                           train_dataset: ConsistencyDataset,
+                          device: torch.device,
                           num_epochs: int = 5,
                           batch_size: int = 8,
                           learning_rate: float = 1e-4) -> None:
@@ -328,9 +438,9 @@ def train_consistency_head(model: ModelWithConsistencyHead,
         
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}"):
             # Move batch to device
-            input_ids = batch["input_ids"].to(model.device)
-            attention_mask = batch["attention_mask"].to(model.device)
-            consistency_labels = batch["consistency_labels"].to(model.device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            consistency_labels = batch["consistency_labels"].to(device)
             
             # Forward pass
             outputs = model(
@@ -359,6 +469,10 @@ def main():
     parser.add_argument("--trajectory_paths", nargs='+', 
                        default=["./data/hotpotqa/trajectory_train_200.jsonl", "./data/2wikimultihop/trajectory_train_200.jsonl"],
                        help="Paths to pre-generated trajectory data files")
+    parser.add_argument("--processed_data_path", type=str, default="./processed_training_examples.json",
+                       help="Path to save/load processed training examples")
+    parser.add_argument("--force_reprocess", action="store_true",
+                       help="Force reprocessing of trajectories even if processed data exists")
     parser.add_argument("--num_epochs", type=int, default=5,
                        help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8,
@@ -413,17 +527,26 @@ def main():
     model = ModelWithConsistencyHead(base_model, consistency_head)
     model.to(device)
     
-    # Load pre-generated trajectories
-    trajectories = load_trajectory_data(args.trajectory_paths)
-    
-    # Create training examples (using the same model as judge for simplicity)
-    training_examples = create_training_examples(trajectories, base_model, tokenizer, tokenizer)
+    # Check if processed training examples already exist
+    if os.path.exists(args.processed_data_path) and not args.force_reprocess:
+        logger.info(f"Found existing processed data at {args.processed_data_path}")
+        training_examples = load_training_examples(args.processed_data_path)
+    else:
+        logger.info("Processing trajectories to create training examples...")
+        # Load pre-generated trajectories
+        trajectories = load_trajectory_data(args.trajectory_paths)
+        
+        # Create training examples (using the same model for both generating answers and judging consistency)
+        training_examples = create_training_examples(trajectories, base_model, tokenizer, base_model, tokenizer)
+        
+        # Save processed training examples for future use
+        save_training_examples(training_examples, args.processed_data_path)
     
     # Create dataset
     train_dataset = ConsistencyDataset(training_examples)
     
     # Train consistency head
-    train_consistency_head(model, train_dataset, args.num_epochs, args.batch_size, args.learning_rate)
+    train_consistency_head(model, train_dataset, device, args.num_epochs, args.batch_size, args.learning_rate)
     
     # Save the trained model
     logger.info(f"Saving trained model to {args.output_dir}")
