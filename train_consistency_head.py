@@ -3,7 +3,7 @@
 Training script for adding and training a consistency head to Qwen3-32B model.
 This script:
 1. Loads Qwen3-32B model and adds a consistency output head
-2. Generates trajectories on 100 HotpotQA training examples
+2. Loads pre-generated trajectories from trajectory_train_200.jsonl
 3. Trains the consistency head to predict whether search answers are consistent with search results
 """
 
@@ -98,13 +98,14 @@ class ModelWithConsistencyHead(nn.Module):
         
         if consistency_labels is not None:
             # Calculate loss
-            loss = nn.BCELoss()(consistency_score, consistency_labels)
+            loss_fct = nn.BCELoss()
+            loss = loss_fct(consistency_score, consistency_labels)
             outputs["loss"] = loss
         
         return outputs
 
 class ConsistencyDataset(Dataset):
-    """Dataset for consistency training."""
+    """Dataset for consistency training examples."""
     
     def __init__(self, examples: List[ConsistencyTrainingExample]):
         self.examples = examples
@@ -113,117 +114,48 @@ class ConsistencyDataset(Dataset):
         return len(self.examples)
     
     def __getitem__(self, idx):
-        example = self.examples[idx]
-        return {
-            "input_ids": example.input_ids,
-            "attention_mask": example.attention_mask,
-            "consistency_label": example.consistency_label,
-            "search_query": example.search_query,
-            "search_results": example.search_results,
-            "model_answer": example.model_answer
-        }
+        return self.examples[idx]
 
-def load_hotpotqa_data(data_path: str, num_examples: int = 100) -> List[Dict[str, Any]]:
-    """Load HotpotQA training data."""
-    logger.info(f"Loading HotpotQA data from {data_path}")
+def load_trajectory_data(trajectory_paths: List[str]) -> List[Dict[str, Any]]:
+    """Load pre-generated trajectories from multiple JSONL files."""
+    logger.info(f"Loading trajectories from {len(trajectory_paths)} files")
     
-    if data_path.endswith('.jsonl'):
-        data = []
-        with open(data_path, 'r', encoding='utf-8') as f:
+    all_trajectories = []
+    for trajectory_path in trajectory_paths:
+        logger.info(f"Loading from {trajectory_path}")
+        trajectories = []
+        with open(trajectory_path, 'r', encoding='utf-8') as f:
             for line in f:
-                data.append(json.loads(line))
-    else:
-        # Try loading as HuggingFace dataset
-        dataset = load_dataset('json', data_files=data_path)
-        data = dataset['train'].to_list()
+                if line.strip():
+                    trajectories.append(json.loads(line))
+        
+        logger.info(f"Loaded {len(trajectories)} trajectories from {trajectory_path}")
+        all_trajectories.extend(trajectories)
     
-    # Take first num_examples
-    data = data[:num_examples]
-    logger.info(f"Loaded {len(data)} examples from HotpotQA")
-    return data
+    logger.info(f"Total trajectories loaded: {len(all_trajectories)}")
+    return all_trajectories
 
-def extract_search_queries_and_answers(trajectory: str) -> List[Tuple[str, str, str]]:
-    """
-    Extract search queries, search results, and model answers from trajectory.
-    Returns list of (search_query, search_results, model_answer) tuples.
-    """
+def extract_search_blocks_and_answers(trajectory: str) -> List[Tuple[str, str, str]]:
+    """Extract search queries, search results, and final answers from trajectory."""
     search_blocks = []
     
     # Find all search blocks
-    search_pattern = rf"{re.escape(BEGIN_OF_SEARCH)}(.*?){re.escape(END_OF_SEARCH)}"
-    info_pattern = rf"{re.escape(BEGIN_OF_INFO)}(.*?){re.escape(END_OF_INFO)}"
+    search_pattern = r'<search>(.*?)</search>\s*<information>(.*?)</information>'
+    search_matches = re.findall(search_pattern, trajectory, re.DOTALL)
     
-    search_matches = list(re.finditer(search_pattern, trajectory, re.DOTALL))
-    info_matches = list(re.finditer(info_pattern, trajectory, re.DOTALL))
+    # Find the final answer
+    answer_pattern = r'<answer>(.*?)</answer>'
+    answer_match = re.search(answer_pattern, trajectory, re.DOTALL)
+    final_answer = answer_match.group(1).strip() if answer_match else ""
     
-    # Match search queries with their corresponding info blocks
-    for i, search_match in enumerate(search_matches):
-        search_query = search_match.group(1).strip()
+    for search_query, search_results in search_matches:
+        search_query = search_query.strip()
+        search_results = search_results.strip()
         
-        # Find the corresponding info block (should be right after the search)
-        search_end = search_match.end()
-        info_start = trajectory.find(BEGIN_OF_INFO, search_end)
-        
-        if info_start != -1:
-            info_end = trajectory.find(END_OF_INFO, info_start)
-            if info_end != -1:
-                search_results = trajectory[info_start + len(BEGIN_OF_INFO):info_end].strip()
-                
-                # Find the model's answer after this search (look for <answer> tags)
-                answer_start = trajectory.find(BEGIN_OF_ANSWER, info_end)
-                if answer_start != -1:
-                    answer_end = trajectory.find(END_OF_ANSWER, answer_start)
-                    if answer_end != -1:
-                        model_answer = trajectory[answer_start + len(BEGIN_OF_ANSWER):answer_end].strip()
-                        search_blocks.append((search_query, search_results, model_answer))
+        if search_query and search_results:
+            search_blocks.append((search_query, search_results, final_answer))
     
     return search_blocks
-
-def generate_trajectories(model, tokenizer, data: List[Dict[str, Any]], 
-                         max_new_tokens: int = 1024) -> List[Dict[str, Any]]:
-    """Generate trajectories using the model on the given data."""
-    logger.info("Generating trajectories...")
-    
-    trajectories = []
-    
-    for item in tqdm(data, desc="Generating trajectories"):
-        question = item["question"]
-        
-        # Create prompt for trajectory generation
-        prompt = f"""Answer the following question step by step. When you need to search for information, use <search>query</search> tags. You will receive search results in <information>results</information> tags. Provide your final answer in <answer>answer</answer> tags.
-
-Question: {question}
-
-Let me think about this step by step:"""
-        
-        # Tokenize input
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        
-        # Generate trajectory
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id
-            )
-        
-        # Decode the generated trajectory
-        trajectory = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract the generated part (after the prompt)
-        generated_part = trajectory[len(prompt):]
-        
-        trajectories.append({
-            "question": question,
-            "trajectory": generated_part,
-            "original_item": item
-        })
-    
-    return trajectories
 
 def judge_consistency(judge_model, judge_tokenizer, search_query: str, 
                      search_results: str, model_answer: str) -> float:
@@ -268,39 +200,38 @@ Answer:"""
 def create_training_examples(trajectories: List[Dict[str, Any]], 
                            judge_model, judge_tokenizer,
                            base_tokenizer) -> List[ConsistencyTrainingExample]:
-    """Create training examples from trajectories."""
-    logger.info("Creating training examples...")
+    """Create training examples from pre-generated trajectories."""
+    logger.info("Creating training examples from trajectories...")
     
     training_examples = []
     
     for trajectory_data in tqdm(trajectories, desc="Processing trajectories"):
         trajectory = trajectory_data["trajectory"]
         
-        # Extract search blocks
-        search_blocks = extract_search_queries_and_answers(trajectory)
+        # Extract search blocks and answers
+        search_blocks = extract_search_blocks_and_answers(trajectory)
         
         for search_query, search_results, model_answer in search_blocks:
             # Judge consistency
-            consistency_score = judge_consistency(
-                judge_model, judge_tokenizer, search_query, search_results, model_answer
-            )
+            consistency_score = judge_consistency(judge_model, judge_tokenizer, 
+                                               search_query, search_results, model_answer)
             
-            # Create input for the model (context + search query + search results + model answer)
+            # Create input text for the model
             input_text = f"""Search Query: {search_query}
 
 Search Results: {search_results}
 
 Model's Answer: {model_answer}
 
-Consistency Score:"""
+Is the model's answer consistent with the search results?"""
             
             # Tokenize input
             inputs = base_tokenizer(
-                input_text, 
-                return_tensors="pt", 
-                truncation=True, 
+                input_text,
+                return_tensors="pt",
+                truncation=True,
                 max_length=2048,
-                padding=True
+                padding=False  # Don't pad here, we'll pad in collate_fn
             )
             
             # Create training example
@@ -324,21 +255,67 @@ def train_consistency_head(model: ModelWithConsistencyHead,
                           batch_size: int = 8,
                           learning_rate: float = 1e-4) -> None:
     """Train the consistency head."""
-    logger.info("Training consistency head...")
+    logger.info("Starting consistency head training...")
     
     # Create data loader
     def collate_fn(batch):
-        input_ids = torch.stack([item["input_ids"] for item in batch])
-        attention_mask = torch.stack([item["attention_mask"] for item in batch])
-        consistency_labels = torch.tensor([item["consistency_label"] for item in batch], dtype=torch.float32)
+        # Pad sequences to the same length
+        max_len = max(len(item.input_ids) for item in batch)
+        
+        input_ids = []
+        attention_masks = []
+        labels = []
+        
+        for item in batch:
+            # Ensure tensors are on CPU for collation
+            item_input_ids = item.input_ids.cpu() if item.input_ids.is_cuda else item.input_ids
+            item_attention_mask = item.attention_mask.cpu() if item.attention_mask.is_cuda else item.attention_mask
+            
+            # Pad input_ids
+            padding_length = max_len - len(item_input_ids)
+            if padding_length > 0:
+                padded_input_ids = torch.cat([
+                    item_input_ids,
+                    torch.zeros(padding_length, dtype=torch.long)
+                ])
+            else:
+                padded_input_ids = item_input_ids
+            input_ids.append(padded_input_ids)
+            
+            # Pad attention_mask
+            padding_length = max_len - len(item_attention_mask)
+            if padding_length > 0:
+                padded_attention_mask = torch.cat([
+                    item_attention_mask,
+                    torch.zeros(padding_length, dtype=torch.long)
+                ])
+            else:
+                padded_attention_mask = item_attention_mask
+            attention_masks.append(padded_attention_mask)
+            
+            labels.append(item.consistency_label)
+        
+        # Debug: Check tensor sizes
+        input_ids_sizes = [tensor.size(0) for tensor in input_ids]
+        attention_mask_sizes = [tensor.size(0) for tensor in attention_masks]
+        
+        if len(set(input_ids_sizes)) > 1:
+            logger.warning(f"Input IDs have different sizes: {input_ids_sizes}")
+        if len(set(attention_mask_sizes)) > 1:
+            logger.warning(f"Attention masks have different sizes: {attention_mask_sizes}")
         
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "consistency_labels": consistency_labels
+            "input_ids": torch.stack(input_ids),
+            "attention_mask": torch.stack(attention_masks),
+            "consistency_labels": torch.tensor(labels, dtype=torch.float)
         }
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn
+    )
     
     # Setup optimizer (only for consistency head parameters)
     optimizer = optim.AdamW(model.consistency_head.parameters(), lr=learning_rate)
@@ -379,10 +356,9 @@ def main():
     parser = argparse.ArgumentParser(description="Train consistency head for Qwen3-32B")
     parser.add_argument("--model_path", type=str, default="/scratch/yl9038/models/Qwen3-32B",
                        help="Path to Qwen3-32B model")
-    parser.add_argument("--data_path", type=str, default="./data/hotpotqa/train.jsonl",
-                       help="Path to HotpotQA training data")
-    parser.add_argument("--num_examples", type=int, default=100,
-                       help="Number of examples to use for trajectory generation")
+    parser.add_argument("--trajectory_paths", nargs='+', 
+                       default=["./data/hotpotqa/trajectory_train_200.jsonl", "./data/2wikimultihop/trajectory_train_200.jsonl"],
+                       help="Paths to pre-generated trajectory data files")
     parser.add_argument("--num_epochs", type=int, default=5,
                        help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8,
@@ -437,11 +413,8 @@ def main():
     model = ModelWithConsistencyHead(base_model, consistency_head)
     model.to(device)
     
-    # Load HotpotQA data
-    data = load_hotpotqa_data(args.data_path, args.num_examples)
-    
-    # Generate trajectories
-    trajectories = generate_trajectories(base_model, tokenizer, data)
+    # Load pre-generated trajectories
+    trajectories = load_trajectory_data(args.trajectory_paths)
     
     # Create training examples (using the same model as judge for simplicity)
     training_examples = create_training_examples(trajectories, base_model, tokenizer, tokenizer)
