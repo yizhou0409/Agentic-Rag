@@ -167,8 +167,8 @@ def load_training_examples(load_path: str) -> List[ConsistencyTrainingExample]:
     training_examples = []
     for item in data:
         example = ConsistencyTrainingExample(
-            input_ids=torch.tensor(item["input_ids"], dtype=torch.long),
-            attention_mask=torch.tensor(item["attention_mask"], dtype=torch.long),
+            input_ids=torch.tensor(item["input_ids"], dtype=torch.long, device="cpu"),
+            attention_mask=torch.tensor(item["attention_mask"], dtype=torch.long, device="cpu"),
             consistency_label=item["consistency_label"],
             search_query=item["search_query"],
             search_results=item["search_results"],
@@ -334,9 +334,16 @@ def create_training_examples(trajectories: List[Dict[str, Any]],
         for search_query, search_results, final_answer in search_blocks:
             try:
                 # Create the context up to </search> position
-                # This is what the model sees when it needs to predict consistency
-                context_text = f"""<search>{search_query}</search>
-<information>{search_results}</information>"""
+                # This should include the full trajectory from the beginning up to this search block
+                # Find the position of this search block in the full trajectory
+                search_pattern = f"<search>{search_query}</search>"
+                search_start = trajectory.find(search_pattern)
+                if search_start == -1:
+                    logger.warning(f"Could not find search pattern in trajectory: {search_query[:50]}...")
+                    continue
+                
+                # Get the full context from beginning of trajectory up to this search block
+                context_text = trajectory[:search_start + len(search_pattern)]
                 
                 # Tokenize the context
                 context_inputs = trained_tokenizer(
@@ -347,6 +354,10 @@ def create_training_examples(trajectories: List[Dict[str, Any]],
                     padding=False
                 )
                 
+                # Move inputs to the same device as the model
+                device = next(trained_model.parameters()).device
+                context_inputs = {k: v.to(device) for k, v in context_inputs.items()}
+                
                 # Get hidden states at the </search> position
                 with torch.no_grad():
                     outputs = trained_model(
@@ -356,24 +367,29 @@ def create_training_examples(trajectories: List[Dict[str, Any]],
                     )
                     hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
                 
-                # The hidden states at the </search> position are what we want to train on
-                # The consistency label is based on whether the final answer is consistent
-                final_consistency = judge_consistency(judge_model, judge_tokenizer, search_query, search_results, final_answer)
+                # Generate a new answer using the model for this search query and results
+                generated_answer = generate_model_answer(trained_model, trained_tokenizer, search_query, search_results)
+                
+                # Judge consistency between the generated answer and search results
+                final_consistency = judge_consistency(judge_model, judge_tokenizer, search_query, search_results, generated_answer)
                 
                 # Create training example with the context up to </search>
+                # Ensure tensors are on CPU to avoid device mismatch issues
                 example = ConsistencyTrainingExample(
-                    input_ids=context_inputs["input_ids"].squeeze(0),
-                    attention_mask=context_inputs["attention_mask"].squeeze(0),
+                    input_ids=context_inputs["input_ids"].squeeze(0).cpu(),
+                    attention_mask=context_inputs["attention_mask"].squeeze(0).cpu(),
                     consistency_label=final_consistency,
                     search_query=search_query,
                     search_results=search_results,
-                    model_answer=final_answer
+                    model_answer=generated_answer
                 )
                 
                 training_examples.append(example)
                 
             except Exception as e:
                 logger.warning(f"Error processing search block {i}: {e}")
+                import traceback
+                logger.debug(f"Full traceback: {traceback.format_exc()}")
                 continue
     
     logger.info(f"Created {len(training_examples)} training examples")
@@ -399,8 +415,8 @@ def train_consistency_head(model: ModelWithConsistencyHead,
         
         for item in batch:
             # Ensure tensors are on CPU for collation
-            item_input_ids = item.input_ids.cpu() if item.input_ids.is_cuda else item.input_ids
-            item_attention_mask = item.attention_mask.cpu() if item.attention_mask.is_cuda else item.attention_mask
+            item_input_ids = item.input_ids.cpu() if item.input_ids.device.type == 'cuda' else item.input_ids
+            item_attention_mask = item.attention_mask.cpu() if item.attention_mask.device.type == 'cuda' else item.attention_mask
             
             # Pad input_ids
             padding_length = max_len - len(item_input_ids)
@@ -426,14 +442,20 @@ def train_consistency_head(model: ModelWithConsistencyHead,
             
             labels.append(item.consistency_label)
         
-        # Debug: Check tensor sizes
+        # Debug: Check tensor sizes and devices
         input_ids_sizes = [tensor.size(0) for tensor in input_ids]
         attention_mask_sizes = [tensor.size(0) for tensor in attention_masks]
+        input_ids_devices = [tensor.device for tensor in input_ids]
+        attention_mask_devices = [tensor.device for tensor in attention_masks]
         
         if len(set(input_ids_sizes)) > 1:
             logger.warning(f"Input IDs have different sizes: {input_ids_sizes}")
         if len(set(attention_mask_sizes)) > 1:
             logger.warning(f"Attention masks have different sizes: {attention_mask_sizes}")
+        if len(set(input_ids_devices)) > 1:
+            logger.warning(f"Input IDs have different devices: {input_ids_devices}")
+        if len(set(attention_mask_devices)) > 1:
+            logger.warning(f"Attention masks have different devices: {attention_mask_devices}")
         
         return {
             "input_ids": torch.stack(input_ids),
@@ -547,6 +569,10 @@ def main():
     # Create model with consistency head
     model = ModelWithConsistencyHead(base_model, consistency_head)
     model.to(device)
+    
+    # Ensure base model is also on the correct device if not using device_map="auto"
+    if not args.use_quantization:
+        base_model.to(device)
     
     # Always generate labeled dataset using the method described
     logger.info("Generating labeled dataset using the consistency training method...")

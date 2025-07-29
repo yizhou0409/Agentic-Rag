@@ -68,6 +68,71 @@ def load_trained_model(model_path: str, consistency_head_path: str,
     
     return model, tokenizer
 
+def generate_answer_and_predict_consistency(model: ModelWithConsistencyHead, tokenizer, 
+                                           search_query: str, search_results: str) -> tuple:
+    """Generate model's answer and predict consistency score at the </search> position."""
+    
+    # Create input context up to </search> position
+    context_text = f"""<search>{search_query}</search>
+<information>{search_results}</information>"""
+    
+    # Tokenize context
+    inputs = tokenizer(
+        context_text, 
+        return_tensors="pt", 
+        truncation=True, 
+        max_length=2048,
+        padding=False
+    )
+    
+    # Move to device
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Predict consistency at </search> position
+    model.eval()
+    with torch.no_grad():
+        outputs = model(**inputs)
+        consistency_score = outputs["consistency_score"].item()
+    
+    # Now generate the model's answer to the search query
+    # Create prompt for answer generation
+    answer_prompt = f"""Search Query: {search_query}
+
+Search Results: {search_results}
+
+Answer:"""
+    
+    # Tokenize answer prompt
+    answer_inputs = tokenizer(
+        answer_prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048,
+        padding=False
+    )
+    
+    # Move to device
+    answer_inputs = {k: v.to(device) for k, v in answer_inputs.items()}
+    
+    # Generate answer
+    with torch.no_grad():
+        generated_outputs = model.base_model.generate(
+            **answer_inputs,
+            max_new_tokens=200,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    
+    # Decode the generated answer
+    generated_text = tokenizer.decode(generated_outputs[0], skip_special_tokens=True)
+    # Extract only the generated part (after the prompt)
+    generated_answer = generated_text[len(answer_prompt):].strip()
+    
+    return generated_answer, consistency_score
+
 def predict_consistency_at_search_position(model: ModelWithConsistencyHead, tokenizer, 
                                          search_query: str, search_results: str) -> float:
     """Predict consistency score at the </search> position."""
@@ -172,7 +237,7 @@ def main():
     ]
     
     print("\n" + "="*80)
-    print("CONSISTENCY PREDICTION AT </search> POSITION")
+    print("GENERATE ANSWER & PREDICT CONSISTENCY")
     print("="*80)
     
     for i, example in enumerate(examples, 1):
@@ -182,14 +247,24 @@ def main():
         print(f"Expected: {example['expected']}")
         print("-" * 60)
         
-        # Predict consistency at </search> position
-        consistency_score = predict_consistency_at_search_position(
+        # Generate answer and predict consistency at </search> position
+        generated_answer, consistency_score = generate_answer_and_predict_consistency(
             model, tokenizer,
             example["search_query"],
             example["search_results"]
         )
         
+        print(f"Generated Answer: {generated_answer}")
         print(f"Consistency Score at </search> position: {consistency_score:.4f}")
+        
+        # Provide interpretation
+        if consistency_score > 0.7:
+            interpretation = "HIGH consistency"
+        elif consistency_score > 0.3:
+            interpretation = "MEDIUM consistency"
+        else:
+            interpretation = "LOW consistency"
+        print(f"Interpretation: {interpretation}")
         print("-" * 60)
     
     # Interactive mode
@@ -197,6 +272,7 @@ def main():
     print("INTERACTIVE MODE")
     print("="*80)
     print("Enter your own examples (press Ctrl+C to exit):")
+    print("Note: The model will generate an answer and predict consistency automatically.")
     
     try:
         while True:
@@ -209,16 +285,14 @@ def main():
                 search_results = input("Search Results: ").strip()
                 if not search_results:
                     continue
-                    
-                model_answer = input("Model Answer: ").strip()
-                if not model_answer:
-                    continue
                 
-                consistency_score = predict_consistency(
-                    model, tokenizer, search_query, search_results, model_answer
+                print("\nGenerating answer and predicting consistency...")
+                generated_answer, consistency_score = generate_answer_and_predict_consistency(
+                    model, tokenizer, search_query, search_results
                 )
                 
-                print(f"\nPredicted Consistency Score: {consistency_score:.4f}")
+                print(f"\nGenerated Answer: {generated_answer}")
+                print(f"Predicted Consistency Score: {consistency_score:.4f}")
                 if consistency_score > 0.7:
                     print("Interpretation: HIGH consistency")
                 elif consistency_score > 0.3:
