@@ -198,22 +198,28 @@ def load_trajectory_data(trajectory_paths: List[str]) -> List[Dict[str, Any]]:
     logger.info(f"Total trajectories loaded: {len(all_trajectories)}")
     return all_trajectories
 
-def extract_search_blocks_and_answers(trajectory: str) -> List[Tuple[str, str, str]]:
+def extract_search_blocks_and_answers(trajectory: str) -> List[Tuple[str, str, str, int]]:
     """Extract search blocks and their corresponding answers from trajectory."""
     search_blocks = []
     
     # Find all search blocks: <search>query</search><information>results</information>
     # Allow for whitespace between the tags
     search_pattern = r'<search>(.*?)</search>\s*<information>(.*?)</information>'
-    search_matches = re.findall(search_pattern, trajectory, re.DOTALL)
+    
+    # Use finditer to get both matches and their positions
+    search_matches = list(re.finditer(search_pattern, trajectory, re.DOTALL))
     
     # Find the final answer
     answer_pattern = r'<answer>(.*?)</answer>'
     answer_match = re.search(answer_pattern, trajectory, re.DOTALL)
     final_answer = answer_match.group(1).strip() if answer_match else ""
     
-    for search_query, search_results in search_matches:
-        search_blocks.append((search_query.strip(), search_results.strip(), final_answer))
+    for match in search_matches:
+        search_query = match.group(1).strip()
+        search_results = match.group(2).strip()
+        # Get the end position of the </search> tag
+        search_end_pos = match.end(1) + len("</search>")
+        search_blocks.append((search_query, search_results, final_answer, search_end_pos))
     
     return search_blocks
 
@@ -331,19 +337,11 @@ def create_training_examples(trajectories: List[Dict[str, Any]],
         # Extract search blocks
         search_blocks = extract_search_blocks_and_answers(trajectory)
         
-        for search_query, search_results, final_answer in search_blocks:
+        for search_query, search_results, final_answer, search_end_pos in search_blocks:
             try:
                 # Create the context up to </search> position
-                # This should include the full trajectory from the beginning up to this search block
-                # Find the position of this search block in the full trajectory
-                search_pattern = f"<search>{search_query}</search>"
-                search_start = trajectory.find(search_pattern)
-                if search_start == -1:
-                    logger.warning(f"Could not find search pattern in trajectory: {search_query[:50]}...")
-                    continue
-                
-                # Get the full context from beginning of trajectory up to this search block
-                context_text = trajectory[:search_start + len(search_pattern)]
+                # Use the position information from the regex match
+                context_text = trajectory[:search_end_pos]
                 
                 # Tokenize the context
                 context_inputs = trained_tokenizer(
