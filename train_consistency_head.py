@@ -49,12 +49,14 @@ class ConsistencyTrainingExample:
     model_answer: str
 
 class ConsistencyHead(nn.Module):
-    """A simple consistency head that predicts whether search answer is consistent with search results."""
+    """A consistency head that predicts consistency at the </search> position."""
     
     def __init__(self, hidden_size: int, dropout: float = 0.1):
         super().__init__()
         self.hidden_size = hidden_size
         self.dropout = nn.Dropout(dropout)
+        
+        # Classifier that takes hidden states and predicts consistency
         self.classifier = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
@@ -64,14 +66,28 @@ class ConsistencyHead(nn.Module):
         )
     
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the consistency head."""
-        # Use the last hidden state for classification
-        last_hidden = hidden_states[:, -1, :]  # [batch_size, hidden_size]
+        """Forward pass of the consistency head.
+        
+        Args:
+            hidden_states: [batch_size, seq_len, hidden_size] - hidden states for each token
+            
+        Returns:
+            consistency_score: [batch_size] - consistency score at the </search> position
+        """
         # Convert to float32 to avoid dtype mismatch with quantized models
-        last_hidden = last_hidden.float()
-        last_hidden = self.dropout(last_hidden)
-        consistency_score = self.classifier(last_hidden)  # [batch_size, 1]
-        return consistency_score.squeeze(-1)  # [batch_size]
+        hidden_states = hidden_states.float()
+        
+        # Apply dropout
+        hidden_states = self.dropout(hidden_states)
+        
+        # Take the last hidden state (at the </search> position)
+        last_hidden = hidden_states[:, -1, :]  # [batch_size, hidden_size]
+        
+        # Predict consistency score for the </search> position
+        # [batch_size, hidden_size] -> [batch_size, 1] -> [batch_size]
+        consistency_score = self.classifier(last_hidden).squeeze(-1)
+        
+        return consistency_score
 
 class ModelWithConsistencyHead(nn.Module):
     """Wrapper model that adds a consistency head to the base model."""
@@ -87,24 +103,26 @@ class ModelWithConsistencyHead(nn.Module):
     
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, 
                 consistency_labels: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """Forward pass with optional consistency prediction."""
+        """Forward pass with consistency prediction at </search> position."""
         # Get hidden states from base model
         with torch.no_grad():
             outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
             hidden_states = outputs.hidden_states[-1]  # Use last layer hidden states
         
-        # Predict consistency score
+        # Predict consistency score at the </search> position
         consistency_score = self.consistency_head(hidden_states)
         
         outputs = {"consistency_score": consistency_score}
         
         if consistency_labels is not None:
-            # Calculate loss
+            # Calculate loss for consistency prediction
             loss_fct = nn.BCELoss()
             loss = loss_fct(consistency_score, consistency_labels)
             outputs["loss"] = loss
         
         return outputs
+    
+
 
 class ConsistencyDataset(Dataset):
     """Dataset for consistency training examples."""
@@ -185,7 +203,8 @@ def extract_search_blocks_and_answers(trajectory: str) -> List[Tuple[str, str, s
     search_blocks = []
     
     # Find all search blocks: <search>query</search><information>results</information>
-    search_pattern = r'<search>(.*?)</search><information>(.*?)</information>'
+    # Allow for whitespace between the tags
+    search_pattern = r'<search>(.*?)</search>\s*<information>(.*?)</information>'
     search_matches = re.findall(search_pattern, trajectory, re.DOTALL)
     
     # Find the final answer
@@ -301,7 +320,7 @@ Answer:"""
 def create_training_examples(trajectories: List[Dict[str, Any]], 
                            trained_model, trained_tokenizer,
                            judge_model, judge_tokenizer) -> List[ConsistencyTrainingExample]:
-    """Create training examples by generating answers and judging consistency."""
+    """Create training examples by extracting hidden states at </search> position."""
     training_examples = []
     
     logger.info(f"Processing {len(trajectories)} trajectories...")
@@ -314,39 +333,41 @@ def create_training_examples(trajectories: List[Dict[str, Any]],
         
         for search_query, search_results, final_answer in search_blocks:
             try:
-                # Generate model's answer to this search query
-                model_answer = generate_model_answer(trained_model, trained_tokenizer, search_query, search_results)
+                # Create the context up to </search> position
+                # This is what the model sees when it needs to predict consistency
+                context_text = f"""<search>{search_query}</search>
+<information>{search_results}</information>"""
                 
-                # Judge consistency using referee model
-                consistency_score = judge_consistency(judge_model, judge_tokenizer, search_query, search_results, model_answer)
-                
-                # Create input text for consistency head training
-                # This should be the context up to the </search> position
-                input_text = f"""Search Query: {search_query}
-
-Search Results: {search_results}
-
-Model's Answer: {model_answer}
-
-Consistency Score:"""
-                
-                # Tokenize input
-                inputs = trained_tokenizer(
-                    input_text,
+                # Tokenize the context
+                context_inputs = trained_tokenizer(
+                    context_text,
                     return_tensors="pt",
                     truncation=True,
                     max_length=2048,
                     padding=False
                 )
                 
-                # Create training example
+                # Get hidden states at the </search> position
+                with torch.no_grad():
+                    outputs = trained_model(
+                        input_ids=context_inputs["input_ids"],
+                        attention_mask=context_inputs["attention_mask"],
+                        output_hidden_states=True
+                    )
+                    hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
+                
+                # The hidden states at the </search> position are what we want to train on
+                # The consistency label is based on whether the final answer is consistent
+                final_consistency = judge_consistency(judge_model, judge_tokenizer, search_query, search_results, final_answer)
+                
+                # Create training example with the context up to </search>
                 example = ConsistencyTrainingExample(
-                    input_ids=inputs["input_ids"].squeeze(0),
-                    attention_mask=inputs["attention_mask"].squeeze(0),
-                    consistency_label=consistency_score,
+                    input_ids=context_inputs["input_ids"].squeeze(0),
+                    attention_mask=context_inputs["attention_mask"].squeeze(0),
+                    consistency_label=final_consistency,
                     search_query=search_query,
                     search_results=search_results,
-                    model_answer=model_answer
+                    model_answer=final_answer
                 )
                 
                 training_examples.append(example)
@@ -527,20 +548,29 @@ def main():
     model = ModelWithConsistencyHead(base_model, consistency_head)
     model.to(device)
     
-    # Check if processed training examples already exist
-    if os.path.exists(args.processed_data_path) and not args.force_reprocess:
-        logger.info(f"Found existing processed data at {args.processed_data_path}")
-        training_examples = load_training_examples(args.processed_data_path)
-    else:
-        logger.info("Processing trajectories to create training examples...")
-        # Load pre-generated trajectories
-        trajectories = load_trajectory_data(args.trajectory_paths)
-        
-        # Create training examples (using the same model for both generating answers and judging consistency)
-        training_examples = create_training_examples(trajectories, base_model, tokenizer, base_model, tokenizer)
-        
-        # Save processed training examples for future use
-        save_training_examples(training_examples, args.processed_data_path)
+    # Always generate labeled dataset using the method described
+    logger.info("Generating labeled dataset using the consistency training method...")
+    
+    # Load pre-generated trajectories
+    trajectories = load_trajectory_data(args.trajectory_paths)
+    logger.info(f"Loaded {len(trajectories)} trajectories")
+    
+    # Create training examples by:
+    # 1. For each </search> block, use trained model to generate answer
+    # 2. Use referee model to judge consistency
+    # 3. Set consistency_label = 1 if consistent, 0 if not
+    # 4. Train consistency head at </search> position
+    training_examples = create_training_examples(trajectories, base_model, tokenizer, base_model, tokenizer)
+    
+    if len(training_examples) == 0:
+        logger.error("No training examples created! This means no search blocks were found in the trajectories.")
+        logger.error("Please check that the trajectory files contain search blocks in the format: <search>query</search><information>results</information>")
+        raise ValueError("No training examples could be created from the trajectories")
+    
+    logger.info(f"Successfully created {len(training_examples)} training examples")
+    
+    # Save processed training examples for future use
+    save_training_examples(training_examples, args.processed_data_path)
     
     # Create dataset
     train_dataset = ConsistencyDataset(training_examples)

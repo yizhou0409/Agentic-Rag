@@ -62,7 +62,40 @@ def load_trained_model(model_path: str, consistency_head_path: str,
     # Create model with consistency head
     model = ModelWithConsistencyHead(base_model, consistency_head)
     
+    # Move consistency head to the same device as base model
+    device = next(base_model.parameters()).device
+    model.consistency_head = model.consistency_head.to(device)
+    
     return model, tokenizer
+
+def predict_consistency_at_search_position(model: ModelWithConsistencyHead, tokenizer, 
+                                         search_query: str, search_results: str) -> float:
+    """Predict consistency score at the </search> position."""
+    
+    # Create input context up to </search> position
+    context_text = f"""<search>{search_query}</search>
+<information>{search_results}</information>"""
+    
+    # Tokenize context
+    inputs = tokenizer(
+        context_text, 
+        return_tensors="pt", 
+        truncation=True, 
+        max_length=2048,
+        padding=False
+    )
+    
+    # Move to device
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Predict consistency at </search> position
+    model.eval()
+    with torch.no_grad():
+        outputs = model(**inputs)
+        consistency_score = outputs["consistency_score"].item()
+    
+    return consistency_score
 
 def predict_consistency(model: ModelWithConsistencyHead, tokenizer, 
                        search_query: str, search_results: str, model_answer: str) -> float:
@@ -94,7 +127,9 @@ Consistency Score:"""
     model.eval()
     with torch.no_grad():
         outputs = model(**inputs)
-        consistency_score = outputs["consistency_score"].item()
+        consistency_scores = outputs["consistency_scores"]
+        # Take the final consistency score
+        consistency_score = consistency_scores[:, -1].item()
     
     return consistency_score
 
@@ -117,52 +152,44 @@ def main():
         args.use_quantization
     )
     
-    # Example predictions
+    # Example predictions at </search> position
     examples = [
         {
             "search_query": "What is the capital of France?",
             "search_results": "Paris is the capital and largest city of France.",
-            "model_answer": "Paris",
-            "expected": "High consistency (should be close to 1.0)"
+            "expected": "High consistency score (should be close to 1.0)"
         },
         {
             "search_query": "What is the capital of France?",
             "search_results": "Paris is the capital and largest city of France.",
-            "model_answer": "London",
-            "expected": "Low consistency (should be close to 0.0)"
+            "expected": "High consistency score (should be close to 1.0)"
         },
         {
             "search_query": "Who wrote Romeo and Juliet?",
             "search_results": "William Shakespeare wrote Romeo and Juliet, a tragedy about two young lovers.",
-            "model_answer": "Shakespeare",
-            "expected": "High consistency (should be close to 1.0)"
-        },
-        {
-            "search_query": "What is the largest planet in our solar system?",
-            "search_results": "Jupiter is the largest planet in our solar system.",
-            "model_answer": "Saturn",
-            "expected": "Low consistency (should be close to 0.0)"
+            "expected": "High consistency score (should be close to 1.0)"
         }
     ]
     
     print("\n" + "="*80)
-    print("CONSISTENCY PREDICTIONS")
+    print("CONSISTENCY PREDICTION AT </search> POSITION")
     print("="*80)
     
     for i, example in enumerate(examples, 1):
-        consistency_score = predict_consistency(
-            model, tokenizer,
-            example["search_query"],
-            example["search_results"],
-            example["model_answer"]
-        )
-        
         print(f"\nExample {i}:")
         print(f"Search Query: {example['search_query']}")
         print(f"Search Results: {example['search_results']}")
-        print(f"Model Answer: {example['model_answer']}")
-        print(f"Predicted Consistency Score: {consistency_score:.4f}")
         print(f"Expected: {example['expected']}")
+        print("-" * 60)
+        
+        # Predict consistency at </search> position
+        consistency_score = predict_consistency_at_search_position(
+            model, tokenizer,
+            example["search_query"],
+            example["search_results"]
+        )
+        
+        print(f"Consistency Score at </search> position: {consistency_score:.4f}")
         print("-" * 60)
     
     # Interactive mode
@@ -174,29 +201,34 @@ def main():
     try:
         while True:
             print("\n" + "-" * 40)
-            search_query = input("Search Query: ").strip()
-            if not search_query:
-                continue
+            try:
+                search_query = input("Search Query: ").strip()
+                if not search_query:
+                    continue
+                    
+                search_results = input("Search Results: ").strip()
+                if not search_results:
+                    continue
+                    
+                model_answer = input("Model Answer: ").strip()
+                if not model_answer:
+                    continue
                 
-            search_results = input("Search Results: ").strip()
-            if not search_results:
-                continue
+                consistency_score = predict_consistency(
+                    model, tokenizer, search_query, search_results, model_answer
+                )
                 
-            model_answer = input("Model Answer: ").strip()
-            if not model_answer:
-                continue
-            
-            consistency_score = predict_consistency(
-                model, tokenizer, search_query, search_results, model_answer
-            )
-            
-            print(f"\nPredicted Consistency Score: {consistency_score:.4f}")
-            if consistency_score > 0.7:
-                print("Interpretation: HIGH consistency")
-            elif consistency_score > 0.3:
-                print("Interpretation: MEDIUM consistency")
-            else:
-                print("Interpretation: LOW consistency")
+                print(f"\nPredicted Consistency Score: {consistency_score:.4f}")
+                if consistency_score > 0.7:
+                    print("Interpretation: HIGH consistency")
+                elif consistency_score > 0.3:
+                    print("Interpretation: MEDIUM consistency")
+                else:
+                    print("Interpretation: LOW consistency")
+                    
+            except EOFError:
+                print("\n\nNo input available. Exiting interactive mode...")
+                break
                 
     except KeyboardInterrupt:
         print("\n\nExiting...")
