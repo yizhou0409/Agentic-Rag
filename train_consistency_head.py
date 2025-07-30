@@ -518,7 +518,7 @@ def main():
     parser.add_argument("--processed_data_path", type=str, default="./processed_training_examples.json",
                        help="Path to save/load processed training examples")
     parser.add_argument("--force_reprocess", action="store_true",
-                       help="Force reprocessing of trajectories even if processed data exists")
+                       help="Force reprocessing of training examples and rewrite processed_training_examples.json even if it exists")
     parser.add_argument("--num_epochs", type=int, default=5,
                        help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8,
@@ -577,29 +577,38 @@ def main():
     if not args.use_quantization:
         base_model.to(device)
     
-    # Always generate labeled dataset using the method described
-    logger.info("Generating labeled dataset using the consistency training method...")
-    
-    # Load pre-generated trajectories
-    trajectories = load_trajectory_data(args.trajectory_paths)
-    logger.info(f"Loaded {len(trajectories)} trajectories")
-    
-    # Create training examples by:
-    # 1. For each </search> block, use trained model to generate answer
-    # 2. Use referee model to judge consistency
-    # 3. Set consistency_label = 1 if consistent, 0 if not
-    # 4. Train consistency head at </search> position
-    training_examples = create_training_examples(trajectories, base_model, tokenizer, base_model, tokenizer)
-    
-    if len(training_examples) == 0:
-        logger.error("No training examples created! This means no search blocks were found in the trajectories.")
-        logger.error("Please check that the trajectory files contain search blocks in the format: <search>query</search><information>results</information>")
-        raise ValueError("No training examples could be created from the trajectories")
-    
-    logger.info(f"Successfully created {len(training_examples)} training examples")
-    
-    # Save processed training examples for future use
-    save_training_examples(training_examples, args.processed_data_path)
+    # Check if processed training examples already exist
+    if os.path.exists(args.processed_data_path) and not args.force_reprocess:
+        logger.info(f"Loading existing processed training examples from {args.processed_data_path}")
+        training_examples = load_training_examples(args.processed_data_path)
+        logger.info(f"Loaded {len(training_examples)} existing training examples")
+    else:
+        if args.force_reprocess and os.path.exists(args.processed_data_path):
+            logger.info(f"Force reprocessing enabled. Will regenerate and overwrite {args.processed_data_path}")
+        elif not os.path.exists(args.processed_data_path):
+            logger.info(f"Processed data file {args.processed_data_path} not found. Generating new training examples.")
+        logger.info("Generating labeled dataset using the consistency training method...")
+        
+        # Load pre-generated trajectories
+        trajectories = load_trajectory_data(args.trajectory_paths)
+        logger.info(f"Loaded {len(trajectories)} trajectories")
+        
+        # Create training examples by:
+        # 1. For each </search> block, use trained model to generate answer
+        # 2. Use referee model to judge consistency
+        # 3. Set consistency_label = 1 if consistent, 0 if not
+        # 4. Train consistency head at </search> position
+        training_examples = create_training_examples(trajectories, base_model, tokenizer, base_model, tokenizer)
+        
+        if len(training_examples) == 0:
+            logger.error("No training examples created! This means no search blocks were found in the trajectories.")
+            logger.error("Please check that the trajectory files contain search blocks in the format: <search>query</search><information>results</information>")
+            raise ValueError("No training examples could be created from the trajectories")
+        
+        logger.info(f"Successfully created {len(training_examples)} training examples")
+        
+        # Save processed training examples for future use
+        save_training_examples(training_examples, args.processed_data_path)
     
     # Create dataset
     train_dataset = ConsistencyDataset(training_examples)
