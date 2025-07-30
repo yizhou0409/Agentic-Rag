@@ -223,14 +223,10 @@ def extract_search_blocks_and_answers(trajectory: str) -> List[Tuple[str, str, s
     
     return search_blocks
 
-def generate_model_answer(model, tokenizer, search_query: str, search_results: str) -> str:
-    """Generate an answer to the search query using the trained model."""
-    # Create prompt for the model to answer the search query
-    prompt = f"""Search Query: {search_query}
-
-Search Results: {search_results}
-
-Based on the search results above, please answer the search query: {search_query}
+def generate_model_answer(model, tokenizer, search_query: str) -> str:
+    """Generate an answer to the search query using the trained model WITHOUT search results."""
+    # Create prompt for the model to answer the search query independently
+    prompt = f"""Question: {search_query}
 
 Answer:"""
     
@@ -269,16 +265,18 @@ Answer:"""
 
 def judge_consistency(judge_model, judge_tokenizer, search_query: str, 
                      search_results: str, model_answer: str) -> float:
-    """Use referee model to judge if model's answer is consistent with search results."""
+    """Use referee model to judge if the central fact in model's answer aligns with search results."""
     
-    # Create prompt for consistency judgment
+    # Create prompt for consistency judgment focusing on central facts
     prompt = f"""Search Query: {search_query}
 
 Search Results: {search_results}
 
 Model's Answer: {model_answer}
 
-Question: Is the model's answer consistent with the search results? Answer with "Yes" or "No".
+Question: Does the central fact or main information in the model's answer align with the search results? 
+Focus only on the most important fact that answers the query. Ignore minor details, style differences, or additional information.
+If the core fact is correct, answer "Yes". If the core fact contradicts or is missing, answer "No".
 
 Answer:"""
     
@@ -314,7 +312,7 @@ Answer:"""
     # Extract only the generated part (after the prompt)
     judgment = generated_text[len(prompt):].strip().lower()
     
-    # Determine consistency score
+    # Determine consistency score based on central fact alignment
     if "yes" in judgment:
         return 1.0
     elif "no" in judgment:
@@ -326,7 +324,14 @@ Answer:"""
 def create_training_examples(trajectories: List[Dict[str, Any]], 
                            trained_model, trained_tokenizer,
                            judge_model, judge_tokenizer) -> List[ConsistencyTrainingExample]:
-    """Create training examples by extracting hidden states at </search> position."""
+    """Create training examples by extracting hidden states at </search> position.
+    
+    The process:
+    1. Extract search query and results from trajectory
+    2. Generate model answer using ONLY the search query (no search results)
+    3. Judge consistency between the independent model answer and search results
+    4. Use original context hidden states for training
+    """
     training_examples = []
     
     logger.info(f"Processing {len(trajectories)} trajectories...")
@@ -365,8 +370,8 @@ def create_training_examples(trajectories: List[Dict[str, Any]],
                     )
                     hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
                 
-                # Generate a new answer using the model for this search query and results
-                generated_answer = generate_model_answer(trained_model, trained_tokenizer, search_query, search_results)
+                # Generate a new answer using the model for this search query (without search results)
+                generated_answer = generate_model_answer(trained_model, trained_tokenizer, search_query)
                 
                 # Judge consistency between the generated answer and search results
                 final_consistency = judge_consistency(judge_model, judge_tokenizer, search_query, search_results, generated_answer)
