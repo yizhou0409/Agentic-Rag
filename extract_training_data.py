@@ -296,7 +296,7 @@ Answer:"""
     with torch.no_grad():
         outputs = judge_model.generate(
             **inputs,
-            max_new_tokens=20,
+            max_new_tokens=10,
             temperature=0.1,
             do_sample=False,  # Use greedy decoding for judgment
             pad_token_id=judge_tokenizer.eos_token_id,
@@ -308,17 +308,16 @@ Answer:"""
     new_tokens = outputs[0][input_length:]
     judgment = judge_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
     
-    # Get the first token (before decoding)
+    # Use all new tokens for consistency determination
     if len(new_tokens) > 0:
-        first_token_id = new_tokens[0].item()
-        first_token = judge_tokenizer.decode([first_token_id], skip_special_tokens=True).strip().lower()
+        all_tokens_text = judge_tokenizer.decode(new_tokens, skip_special_tokens=True).strip().lower()
     else:
-        first_token = ""
+        all_tokens_text = ""
     
-    # Convert to consistency score based on first token only
-    if first_token == "inconsistent":
+    # Convert to consistency score based on all tokens
+    if "inconsistent" in all_tokens_text:
         return 0.0, judgment
-    elif first_token == "consistent":
+    elif "consistent" in all_tokens_text:
         return 1.0, judgment
     else:
         return -1, judgment
@@ -354,12 +353,13 @@ def process_multiple_datasets(dataset_paths: List[str], base_model_path: str, ju
         training_examples = []
         processed_count = 0
         
+        # Show progress every 10 examples
+        progress_interval = max(1, min(10, len(dataset) // 10))
+        
         for i, example in enumerate(dataset):
             if processed_count >= max_examples_per_dataset:
                 break
                 
-            logger.info(f"Processing example {i+1}/{min(len(dataset), max_examples_per_dataset)}")
-            
             # Extract trajectory text (assuming it's in 'trajectory' field)
             trajectory_text = example.get('trajectory', '')
             if not trajectory_text:
@@ -370,19 +370,14 @@ def process_multiple_datasets(dataset_paths: List[str], base_model_path: str, ju
             if not extracted_list:
                 continue
             
-            logger.info(f"Found {len(extracted_list)} search queries in this trajectory")
-            
             for extracted in extracted_list:
                 search_query = extracted['search_query']
                 search_context = extracted['search_context']
                 search_answer = extracted['search_answer']
                 
-                logger.info(f"Processing search query: {search_query[:100]}...")
-                
                 try:
                     # Generate model's answer
                     model_answer = generate_model_answer(base_model, base_tokenizer, search_query)
-                    logger.info(f"Model answer: {model_answer[:100]}...")
                     
                     # Judge consistency and get original judgment text
                     consistency_score, judge_output = judge_consistency_with_output(
@@ -392,9 +387,6 @@ def process_multiple_datasets(dataset_paths: List[str], base_model_path: str, ju
 
                     if consistency_score == -1:
                         continue
-                    
-                    logger.info(f"Judge output: {judge_output}")
-                    logger.info(f"Consistency score: {consistency_score}")
                     
                     # Create training example with judge output
                     training_example = {
@@ -418,6 +410,10 @@ def process_multiple_datasets(dataset_paths: List[str], base_model_path: str, ju
                 except Exception as e:
                     logger.error(f"Error processing search query: {e}")
                     continue
+            
+            # Show progress periodically
+            if (i + 1) % progress_interval == 0:
+                logger.info(f"Dataset {dataset_path.split('/')[-2]}: Processed {i+1}/{len(dataset)} examples, {processed_count} successful")
             
             # Check if we've reached the limit for this dataset
             if processed_count >= max_examples_per_dataset:

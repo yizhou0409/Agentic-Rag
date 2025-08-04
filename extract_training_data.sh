@@ -26,7 +26,7 @@ python extract_training_data.py \
     --base_model_path /scratch/yl9038/models/Qwen3-32B \
     --judge_model_path /scratch/yl9038/models/Qwen3-32B \
     --output_path ./extracted_training_data.json \
-    --max_examples_per_dataset 5 \
+    --max_examples_per_dataset 10000 \
     --use_quantization
 
 echo "Extraction completed!" 
