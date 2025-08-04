@@ -264,7 +264,12 @@ Answer: Inconsistent
 Question: What is the speed of light?
 Search Results: The speed of light is approximately 299,792 kilometers per second.
 Model's Answer: About 300,000 km/s
-Answer: Consistent
+Answer: Inconsistent
+
+Question: How many Grand Slam titles did Henri Leconte win?
+Search Results: Henri Leconte won three Grand Slam singles titles: the 1985 French Open, the 1986 French Open, and the 1985 US Open.
+Model's Answer: Henri Leconte won 1 Grand Slam title, the 1985 French Open doubles with Yannick Noah. He did not win any Grand Slam singles titles.
+Answer: Inconsistent
 
 ---
 
@@ -303,10 +308,17 @@ Answer:"""
     new_tokens = outputs[0][input_length:]
     judgment = judge_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
     
-    # Convert to consistency score
-    if "inconsistent" in judgment.lower():
+    # Get the first token (before decoding)
+    if len(new_tokens) > 0:
+        first_token_id = new_tokens[0].item()
+        first_token = judge_tokenizer.decode([first_token_id], skip_special_tokens=True).strip().lower()
+    else:
+        first_token = ""
+    
+    # Convert to consistency score based on first token only
+    if first_token == "inconsistent":
         return 0.0, judgment
-    elif "consistent" in judgment.lower():
+    elif first_token == "consistent":
         return 1.0, judgment
     else:
         return -1, judgment
@@ -367,7 +379,7 @@ def process_multiple_datasets(dataset_paths: List[str], base_model_path: str, ju
                 
                 logger.info(f"Processing search query: {search_query[:100]}...")
                 
-                                try:
+                try:
                     # Generate model's answer
                     model_answer = generate_model_answer(base_model, base_tokenizer, search_query)
                     logger.info(f"Model answer: {model_answer[:100]}...")
