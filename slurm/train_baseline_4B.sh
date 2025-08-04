@@ -43,7 +43,7 @@ torchrun --nproc_per_node=4 LLaMA-Factory/src/train.py \
     --stage sft \
     --do_train \
     --finetuning_type full \
-    --dataset 2wikimultihop_teacher_alpaca,hotpotqa_teacher_alpaca \
+    --dataset 2wikimultihop_baseline_alpaca,hotpotqa_baseline_alpaca \
     --dataset_dir LLaMA-Factory/data \
     --template default \
     --cutoff_len 2048 \
@@ -51,7 +51,7 @@ torchrun --nproc_per_node=4 LLaMA-Factory/src/train.py \
     --overwrite_cache \
     --preprocessing_num_workers 4 \
     --dataloader_num_workers 2 \
-    --output_dir trained_teacher_models/qwen3-4b \
+    --output_dir trained_baseline_models/qwen3-4b \
     --logging_steps 5 \
     --save_steps 100 \
     --plot_loss \

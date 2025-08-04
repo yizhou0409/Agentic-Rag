@@ -38,12 +38,12 @@ nvidia-smi
 # Run the LLaMA-Factory training using CLI with torchrun
 echo "Starting LLaMA-Factory training..."
 torchrun --nproc_per_node=4 LLaMA-Factory/src/train.py \
-    --model_name_or_path /scratch/yl9038/models/Qwen3-4B \
+    --model_name_or_path /scratch/yl9038/models/Qwen3-8B \
     --trust_remote_code \
     --stage sft \
     --do_train \
     --finetuning_type full \
-    --dataset 2wikimultihop_teacher_alpaca,hotpotqa_teacher_alpaca \
+    --dataset 2wikimultihop_baseline_alpaca,hotpotqa_baseline_alpaca \
     --dataset_dir LLaMA-Factory/data \
     --template default \
     --cutoff_len 2048 \
@@ -51,7 +51,7 @@ torchrun --nproc_per_node=4 LLaMA-Factory/src/train.py \
     --overwrite_cache \
     --preprocessing_num_workers 4 \
     --dataloader_num_workers 2 \
-    --output_dir trained_teacher_models/qwen3-4b \
+    --output_dir trained_baseline_models/qwen3-8b \
     --logging_steps 5 \
     --save_steps 100 \
     --plot_loss \
