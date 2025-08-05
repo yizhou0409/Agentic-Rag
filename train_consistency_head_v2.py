@@ -26,18 +26,37 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class ConsistencyHead(nn.Module):
-    """Consistency head that predicts consistency score."""
+    """Consistency head that predicts consistency score with multiple layers."""
     
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, layer_sizes: List[int] = None, target_layer: int = -1):
         super().__init__()
-        self.linear = nn.Linear(hidden_size, 1)
+        if layer_sizes is None:
+            layer_sizes = [hidden_size, 512, 256, 1]
+        
+        self.target_layer = target_layer
+        self.layers = nn.ModuleList()
+        
+        # Build layers
+        for i in range(len(layer_sizes) - 1):
+            layer = nn.Sequential(
+                nn.Linear(layer_sizes[i], layer_sizes[i + 1]),
+                nn.ReLU() if i < len(layer_sizes) - 2 else nn.Identity(),  # No activation on final layer
+                nn.Dropout(0.1) if i < len(layer_sizes) - 2 else nn.Identity(),  # No dropout on final layer
+                nn.BatchNorm1d(layer_sizes[i + 1]) if i < len(layer_sizes) - 2 else nn.Identity()  # No BN on final layer
+            )
+            self.layers.append(layer)
     
     def forward(self, hidden_states):
-        # Take the last token's hidden state
-        last_hidden = hidden_states[:, -1, :]
-        # Predict consistency logits (will be passed through sigmoid in BCELoss)
-        consistency_logits = self.linear(last_hidden)
-        return consistency_logits
+        # Take the last token's hidden state from the target layer
+        last_hidden = hidden_states[self.target_layer][:, -1, :]
+        
+        # Pass through all layers
+        x = last_hidden
+        for layer in self.layers:
+            x = layer(x)
+        
+        # Return logits (final layer output)
+        return x
 
 class ModelWithConsistencyHead(nn.Module):
     """Wrapper model that adds consistency head to base model."""
@@ -51,8 +70,8 @@ class ModelWithConsistencyHead(nn.Module):
         # Get base model outputs
         outputs = self.base_model(**kwargs, output_hidden_states=True)
         
-        # Get hidden states from the last layer and convert to float32
-        hidden_states = outputs.hidden_states[-1].to(dtype=torch.float32)
+        # Convert all hidden states to float32
+        hidden_states = [hs.to(dtype=torch.float32) for hs in outputs.hidden_states]
         
         # Predict consistency logits
         consistency_logits = self.consistency_head(hidden_states)
@@ -146,7 +165,8 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
                           training_data: List[Dict[str, Any]], 
                           num_epochs: int = 10, batch_size: int = 4,
                           learning_rate: float = 3e-4, save_path: str = "./trained_consistency_head.pt",
-                          validation_split: float = 0.2, early_stopping_patience: int = 3):
+                          validation_split: float = 0.2, early_stopping_patience: int = 3,
+                          scheduler_type: str = "step", step_size: int = 50, gamma: float = 0.9):
     """Train the consistency head with improved hyperparameters for the dataset."""
     
     logger.info("Starting consistency head training...")
@@ -165,8 +185,15 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
     # Set up optimizer (only for consistency head)
     optimizer = optim.AdamW(model.consistency_head.parameters(), lr=learning_rate, weight_decay=1e-4)
     
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+    # Learning rate scheduler - choose between step-based and plateau-based
+    if scheduler_type == "step":
+        # Step-based scheduler that reduces LR every N steps
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma, verbose=True)
+        logger.info(f"Using StepLR scheduler: step_size={step_size}, gamma={gamma}")
+    else:
+        # Plateau-based scheduler that reduces LR when validation loss plateaus
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+        logger.info("Using ReduceLROnPlateau scheduler")
     
     # Loss function for consistency prediction - Cross-entropy for binary classification
     consistency_loss_fn = nn.BCELoss()
@@ -294,7 +321,10 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
         val_accuracy = val_correct / val_total if val_total > 0 else 0
         
         # Update learning rate scheduler
-        scheduler.step(avg_val_loss)
+        if scheduler_type == "step":
+            scheduler.step()  # StepLR doesn't need validation loss
+        else:
+            scheduler.step(avg_val_loss)  # ReduceLROnPlateau needs validation loss
         
         logger.info(f"Epoch {epoch + 1}: Train Loss = {avg_train_loss:.4f}, Train Acc = {train_accuracy:.4f}, "
                    f"Val Loss = {avg_val_loss:.4f}, Val Acc = {val_accuracy:.4f}, "
@@ -340,6 +370,16 @@ def main():
                        help="Fraction of data to use for validation")
     parser.add_argument("--early_stopping_patience", type=int, default=3,
                        help="Number of epochs to wait before early stopping")
+    parser.add_argument("--layer_sizes", type=str, default="512,256",
+                       help="Comma-separated list of layer sizes for consistency head (excluding input and output)")
+    parser.add_argument("--target_layer", type=int, default=-1,
+                       help="Which layer to probe (-1 for last layer, 0 for first layer, etc.)")
+    parser.add_argument("--scheduler_type", type=str, default="step", choices=["step", "plateau"],
+                       help="Type of learning rate scheduler: 'step' or 'plateau'")
+    parser.add_argument("--step_size", type=int, default=50,
+                       help="Step size for StepLR scheduler (every N steps)")
+    parser.add_argument("--gamma", type=float, default=0.9,
+                       help="Gamma (decay factor) for StepLR scheduler")
     
     args = parser.parse_args()
     
@@ -350,8 +390,18 @@ def main():
     hidden_size = base_model.config.hidden_size
     logger.info(f"Model hidden size: {hidden_size}")
     
+    # Parse layer sizes
+    layer_sizes = [hidden_size] + [int(size.strip()) for size in args.layer_sizes.split(',')] + [1]
+    logger.info(f"Consistency head layer sizes: {layer_sizes}")
+    
+    # Log target layer information
+    if args.target_layer == -1:
+        logger.info(f"Probing the last layer (layer {args.target_layer})")
+    else:
+        logger.info(f"Probing layer {args.target_layer}")
+    
     # Create consistency head with float32 for numerical stability
-    consistency_head = ConsistencyHead(hidden_size).to(dtype=torch.float32)
+    consistency_head = ConsistencyHead(hidden_size, layer_sizes=layer_sizes, target_layer=args.target_layer).to(dtype=torch.float32)
     
     # Create model with consistency head
     model = ModelWithConsistencyHead(base_model, consistency_head)
@@ -359,6 +409,10 @@ def main():
     # Move consistency head to the same device as base model
     device = next(base_model.parameters()).device
     model.consistency_head = model.consistency_head.to(device)
+    
+    # Count parameters in consistency head
+    consistency_head_params = sum(p.numel() for p in model.consistency_head.parameters())
+    logger.info(f"Consistency head parameters: {consistency_head_params:,}")
     
     # Freeze base model parameters (only train consistency head)
     for param in model.base_model.parameters():
@@ -374,7 +428,8 @@ def main():
         model, tokenizer, training_data,
         args.num_epochs, args.batch_size,
         args.learning_rate, args.save_path,
-        args.validation_split, args.early_stopping_patience
+        args.validation_split, args.early_stopping_patience,
+        args.scheduler_type, args.step_size, args.gamma
     )
 
 if __name__ == "__main__":
