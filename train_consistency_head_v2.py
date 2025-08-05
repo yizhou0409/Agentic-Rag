@@ -45,17 +45,34 @@ class ConsistencyHead(nn.Module):
             )
             self.layers.append(layer)
     
-    def forward(self, hidden_states):
-        # Take the last token's hidden state from the target layer
-        last_hidden = hidden_states[self.target_layer][:, -1, :]
+    def forward(self, hidden_states, target_positions=None):
+        # If target_positions is provided, use those specific positions
+        # Otherwise, fall back to the last token (for backward compatibility)
+        if target_positions is not None:
+            # Extract hidden states at specific target positions
+            batch_size = hidden_states[self.target_layer].shape[0]
+            target_hidden = torch.zeros(batch_size, hidden_states[self.target_layer].shape[-1], 
+                                      device=hidden_states[self.target_layer].device, 
+                                      dtype=hidden_states[self.target_layer].dtype)
+            
+            for i, pos in enumerate(target_positions):
+                if pos < hidden_states[self.target_layer].shape[1]:
+                    target_hidden[i] = hidden_states[self.target_layer][i, pos, :]
+                else:
+                    # Fallback to last position if target position is out of bounds
+                    target_hidden[i] = hidden_states[self.target_layer][i, -1, :]
+        else:
+            # Take the last token's hidden state from the target layer (original behavior)
+            target_hidden = hidden_states[self.target_layer][:, -1, :]
         
         # Pass through all layers
-        x = last_hidden
+        x = target_hidden
         for layer in self.layers:
             x = layer(x)
         
-        # Return logits (final layer output)
-        return x
+        # Apply sigmoid to get probabilities (0-1 range) for MSE loss
+        consistency_score = torch.sigmoid(x)
+        return consistency_score
 
 class ModelWithConsistencyHead(nn.Module):
     """Wrapper model that adds consistency head to base model."""
@@ -66,18 +83,21 @@ class ModelWithConsistencyHead(nn.Module):
         self.consistency_head = consistency_head
     
     def forward(self, **kwargs):
+        # Extract target_positions if provided
+        target_positions = kwargs.pop('target_positions', None)
+        
         # Get base model outputs
         outputs = self.base_model(**kwargs, output_hidden_states=True)
         
         # Convert all hidden states to float32
         hidden_states = [hs.to(dtype=torch.float32) for hs in outputs.hidden_states]
         
-        # Predict consistency logits
-        consistency_logits = self.consistency_head(hidden_states)
+        # Predict consistency score with target positions
+        consistency_score = self.consistency_head(hidden_states, target_positions)
         
         return {
             "logits": outputs.logits,
-            "consistency_logits": consistency_logits
+            "consistency_score": consistency_score
         }
 
 def load_model(model_path: str, use_quantization: bool = True, use_multi_gpu: bool = False):
@@ -158,7 +178,37 @@ def create_training_input(question: str, search_context: str, tokenizer: AutoTok
         padding=False
     )
     
-    return inputs
+    # Find the position of the '>' token at the end of '</search>'
+    target_position = find_closing_search_position(input_text, tokenizer)
+    
+    return inputs, target_position
+
+def find_closing_search_position(text: str, tokenizer: AutoTokenizer) -> int:
+    """Find the position of the '>' token at the end of '</search>' in the tokenized sequence."""
+    
+    # Find the last occurrence of '</search>' in the text
+    search_end = text.rfind('</search>')
+    if search_end == -1:
+        # If no '</search>' found, return the last position
+        logger.warning("No '</search>' found in text, using last position")
+        return -1
+    
+    # Find the position of the '>' character
+    closing_bracket_pos = search_end + len('</search>') - 1  # Position of '>'
+    
+    # Tokenize the text up to the closing bracket position
+    text_before_closing = text[:closing_bracket_pos + 1]
+    tokens = tokenizer.encode(text_before_closing, add_special_tokens=False)
+    
+    # The target position is the last token (which should be the '>' token)
+    target_position = len(tokens) - 1
+    
+    # Debug: Log the target token
+    if target_position >= 0:
+        target_token = tokenizer.decode([tokens[target_position]]) if target_position < len(tokens) else "OUT_OF_BOUNDS"
+        logger.debug(f"Target position {target_position}, token: '{target_token}'")
+    
+    return target_position
 
 def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoTokenizer, 
                           training_data: List[Dict[str, Any]], 
@@ -194,12 +244,12 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
         logger.info("Using ReduceLROnPlateau scheduler")
     
-    # Loss function for consistency prediction - Cross-entropy for binary classification
-    consistency_loss_fn = nn.BCELoss()
+    # Loss function for consistency prediction - MSE for regression
+    consistency_loss_fn = nn.MSELoss()
     
     # Training loop with early stopping
     model.train()
-    best_val_loss = float('inf')
+    best_val_accuracy = 0.0
     patience_counter = 0
     
     for epoch in range(num_epochs):
@@ -224,35 +274,41 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
                     consistency_label = example['consistency_label']
                     
                     # Create input
-                    inputs = create_training_input(question, search_context, tokenizer)
+                    inputs, target_position = create_training_input(question, search_context, tokenizer)
                     
                     # Move to device
                     device = next(model.parameters()).device
                     inputs = {k: v.to(device) for k, v in inputs.items()}
                     consistency_label = torch.tensor([[consistency_label]], dtype=torch.float32).to(device)
                     
+                    # Add target position to inputs
+                    inputs['target_positions'] = [target_position]
+                    
+                    # Log target position for debugging (only first few examples)
+                    if i < 5:
+                        logger.info(f"Example {i}: Target position for '>' token: {target_position}")
+                    
                     # Forward pass
                     outputs = model(**inputs)
-                    predicted_logits = outputs['consistency_logits']
+                    predicted_score = outputs['consistency_score']
                     
                     # Debug: Check for NaN in predictions
-                    if torch.isnan(predicted_logits).any():
+                    if torch.isnan(predicted_score).any():
                         logger.warning(f"NaN detected in predictions")
                         continue
                     
-                    # Calculate loss (BCELoss expects inputs between 0 and 1)
-                    predicted_probs = torch.sigmoid(predicted_logits)
-                    loss = consistency_loss_fn(predicted_probs, consistency_label)
+                    # Calculate loss (MSE loss)
+                    loss = consistency_loss_fn(predicted_score, consistency_label)
                     
                     # Debug: Check for NaN in loss
                     if torch.isnan(loss):
-                        logger.warning(f"NaN loss detected, predicted: {predicted_probs.item():.6f}, target: {consistency_label.item():.6f}")
+                        logger.warning(f"NaN loss detected, predicted: {predicted_score.item():.6f}, target: {consistency_label.item():.6f}")
                         continue
                     
                     batch_loss += loss
                     
                     # Count correct predictions (threshold at 0.5)
-                    pred_binary = (predicted_probs > 0.5).float()
+                    pred_binary = (predicted_score > 0.5).float()
                     target_binary = (consistency_label > 0.5).float()
                     train_correct += (pred_binary == target_binary).sum().item()
                     train_total += 1
@@ -290,24 +346,26 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
                     consistency_label = example['consistency_label']
                     
                     # Create input
-                    inputs = create_training_input(question, search_context, tokenizer)
+                    inputs, target_position = create_training_input(question, search_context, tokenizer)
                     
                     # Move to device
                     device = next(model.parameters()).device
                     inputs = {k: v.to(device) for k, v in inputs.items()}
                     consistency_label = torch.tensor([[consistency_label]], dtype=torch.float32).to(device)
                     
+                    # Add target position to inputs
+                    inputs['target_positions'] = [target_position]
+                    
                     # Forward pass
                     outputs = model(**inputs)
-                    predicted_logits = outputs['consistency_logits']
+                    predicted_score = outputs['consistency_score']
                     
-                    # Calculate loss (BCELoss expects inputs between 0 and 1)
-                    predicted_probs = torch.sigmoid(predicted_logits)
-                    loss = consistency_loss_fn(predicted_probs, consistency_label)
+                    # Calculate loss (MSE loss)
+                    loss = consistency_loss_fn(predicted_score, consistency_label)
                     val_loss += loss.item()
                     
                     # Count correct predictions
-                    pred_binary = (predicted_probs > 0.5).float()
+                    pred_binary = (predicted_score > 0.5).float()
                     target_binary = (consistency_label > 0.5).float()
                     val_correct += (pred_binary == target_binary).sum().item()
                     val_total += 1
@@ -329,23 +387,23 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
                    f"Val Loss = {avg_val_loss:.4f}, Val Acc = {val_accuracy:.4f}, "
                    f"LR = {optimizer.param_groups[0]['lr']:.2e}")
         
-        # Early stopping
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        # Early stopping based on validation accuracy
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
             patience_counter = 0
             # Save best model
-            logger.info(f"New best validation loss: {best_val_loss:.4f}")
+            logger.info(f"New best validation accuracy: {best_val_accuracy:.4f}")
             torch.save(model.consistency_head.state_dict(), save_path)
         else:
             patience_counter += 1
-            logger.info(f"Validation loss didn't improve. Patience: {patience_counter}/{early_stopping_patience}")
+            logger.info(f"Validation accuracy didn't improve. Patience: {patience_counter}/{early_stopping_patience}")
             
             if patience_counter >= early_stopping_patience:
                 logger.info("Early stopping triggered!")
                 break
     
     logger.info("Training completed!")
-    logger.info(f"Best validation loss: {best_val_loss:.4f}")
+    logger.info(f"Best validation accuracy: {best_val_accuracy:.4f}")
 
 def main():
     parser = argparse.ArgumentParser(description="Train consistency head on 32B model")
