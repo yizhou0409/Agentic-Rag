@@ -41,8 +41,7 @@ class ConsistencyHead(nn.Module):
             layer = nn.Sequential(
                 nn.Linear(layer_sizes[i], layer_sizes[i + 1]),
                 nn.ReLU() if i < len(layer_sizes) - 2 else nn.Identity(),  # No activation on final layer
-                nn.Dropout(0.1) if i < len(layer_sizes) - 2 else nn.Identity(),  # No dropout on final layer
-                nn.BatchNorm1d(layer_sizes[i + 1]) if i < len(layer_sizes) - 2 else nn.Identity()  # No BN on final layer
+                nn.Dropout(0.1) if i < len(layer_sizes) - 2 else nn.Identity()  # No dropout on final layer
             )
             self.layers.append(layer)
     
