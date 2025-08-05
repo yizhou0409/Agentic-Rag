@@ -35,9 +35,9 @@ class ConsistencyHead(nn.Module):
     def forward(self, hidden_states):
         # Take the last token's hidden state
         last_hidden = hidden_states[:, -1, :]
-        # Predict consistency score (0-1 range)
-        consistency_score = torch.sigmoid(self.linear(last_hidden))
-        return consistency_score
+        # Predict consistency logits (will be passed through sigmoid in BCELoss)
+        consistency_logits = self.linear(last_hidden)
+        return consistency_logits
 
 class ModelWithConsistencyHead(nn.Module):
     """Wrapper model that adds consistency head to base model."""
@@ -54,12 +54,12 @@ class ModelWithConsistencyHead(nn.Module):
         # Get hidden states from the last layer and convert to float32
         hidden_states = outputs.hidden_states[-1].to(dtype=torch.float32)
         
-        # Predict consistency score
-        consistency_score = self.consistency_head(hidden_states)
+        # Predict consistency logits
+        consistency_logits = self.consistency_head(hidden_states)
         
         return {
             "logits": outputs.logits,
-            "consistency_score": consistency_score
+            "consistency_logits": consistency_logits
         }
 
 def load_model(model_path: str, use_quantization: bool = True, use_multi_gpu: bool = False):
@@ -168,8 +168,8 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
     
-    # Loss function for consistency prediction - MSE for regression
-    consistency_loss_fn = nn.MSELoss()
+    # Loss function for consistency prediction - Cross-entropy for binary classification
+    consistency_loss_fn = nn.BCELoss()
     
     # Training loop with early stopping
     model.train()
@@ -207,25 +207,26 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
                     
                     # Forward pass
                     outputs = model(**inputs)
-                    predicted_consistency = outputs['consistency_score']
+                    predicted_logits = outputs['consistency_logits']
                     
                     # Debug: Check for NaN in predictions
-                    if torch.isnan(predicted_consistency).any():
+                    if torch.isnan(predicted_logits).any():
                         logger.warning(f"NaN detected in predictions")
                         continue
                     
-                    # Calculate loss
-                    loss = consistency_loss_fn(predicted_consistency, consistency_label)
+                    # Calculate loss (BCELoss expects inputs between 0 and 1)
+                    predicted_probs = torch.sigmoid(predicted_logits)
+                    loss = consistency_loss_fn(predicted_probs, consistency_label)
                     
                     # Debug: Check for NaN in loss
                     if torch.isnan(loss):
-                        logger.warning(f"NaN loss detected, predicted: {predicted_consistency.item():.6f}, target: {consistency_label.item():.6f}")
+                        logger.warning(f"NaN loss detected, predicted: {predicted_probs.item():.6f}, target: {consistency_label.item():.6f}")
                         continue
                     
                     batch_loss += loss
                     
                     # Count correct predictions (threshold at 0.5)
-                    pred_binary = (predicted_consistency > 0.5).float()
+                    pred_binary = (predicted_probs > 0.5).float()
                     target_binary = (consistency_label > 0.5).float()
                     train_correct += (pred_binary == target_binary).sum().item()
                     train_total += 1
@@ -272,14 +273,15 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
                     
                     # Forward pass
                     outputs = model(**inputs)
-                    predicted_consistency = outputs['consistency_score']
+                    predicted_logits = outputs['consistency_logits']
                     
-                    # Calculate loss
-                    loss = consistency_loss_fn(predicted_consistency, consistency_label)
+                    # Calculate loss (BCELoss expects inputs between 0 and 1)
+                    predicted_probs = torch.sigmoid(predicted_logits)
+                    loss = consistency_loss_fn(predicted_probs, consistency_label)
                     val_loss += loss.item()
                     
                     # Count correct predictions
-                    pred_binary = (predicted_consistency > 0.5).float()
+                    pred_binary = (predicted_probs > 0.5).float()
                     target_binary = (consistency_label > 0.5).float()
                     val_correct += (pred_binary == target_binary).sum().item()
                     val_total += 1

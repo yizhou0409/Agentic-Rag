@@ -24,7 +24,7 @@ echo "Starting consistency head training on 32B model..."
 python train_consistency_head_v2.py \
     --model_path /scratch/yl9038/models/Qwen3-32B \
     --training_data_path ./extracted_training_data.json \
-    --save_path ./trained_consistency_head_v2.pt \
+    --save_path ./trained_consistency_head_last_layer.pt \
     --num_epochs 10 \
     --batch_size 8 \
     --learning_rate 3e-4 \
