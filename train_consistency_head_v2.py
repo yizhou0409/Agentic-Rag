@@ -144,91 +144,177 @@ def create_training_input(question: str, search_context: str, tokenizer: AutoTok
 
 def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoTokenizer, 
                           training_data: List[Dict[str, Any]], 
-                          num_epochs: int = 3, batch_size: int = 1,
-                          learning_rate: float = 1e-4, save_path: str = "./trained_consistency_head.pt"):
-    """Train the consistency head."""
+                          num_epochs: int = 10, batch_size: int = 4,
+                          learning_rate: float = 3e-4, save_path: str = "./trained_consistency_head.pt",
+                          validation_split: float = 0.2, early_stopping_patience: int = 3):
+    """Train the consistency head with improved hyperparameters for the dataset."""
     
     logger.info("Starting consistency head training...")
     
+    # Split data into train and validation
+    import random
+    random.seed(42)
+    random.shuffle(training_data)
+    
+    split_idx = int(len(training_data) * (1 - validation_split))
+    train_data = training_data[:split_idx]
+    val_data = training_data[split_idx:]
+    
+    logger.info(f"Training examples: {len(train_data)}, Validation examples: {len(val_data)}")
+    
     # Set up optimizer (only for consistency head)
-    optimizer = optim.AdamW(model.consistency_head.parameters(), lr=learning_rate)
+    optimizer = optim.AdamW(model.consistency_head.parameters(), lr=learning_rate, weight_decay=1e-4)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
     
     # Loss function for consistency prediction - MSE for regression
     consistency_loss_fn = nn.MSELoss()
     
-    # Training loop
+    # Training loop with early stopping
     model.train()
-    total_loss = 0
+    best_val_loss = float('inf')
+    patience_counter = 0
     
     for epoch in range(num_epochs):
         logger.info(f"Epoch {epoch + 1}/{num_epochs}")
-        epoch_loss = 0
         
-        for i, example in enumerate(training_data):
-            try:
-                # Get training data
-                question = example['question']
-                search_context = example['search_context']
-                consistency_label = example['consistency_label']
-                
-                # Debug: Log the first few examples
-                if i < 5:
-                    logger.info(f"Example {i}: question='{question[:50]}...', label={consistency_label}")
-                
-                # Create input
-                inputs = create_training_input(question, search_context, tokenizer)
-                
-                # Move to device
-                device = next(model.parameters()).device
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-                consistency_label = torch.tensor([[consistency_label]], dtype=torch.float32).to(device)
-                
-                # Forward pass
-                outputs = model(**inputs)
-                predicted_consistency = outputs['consistency_score']
-                
-                # Debug: Check for NaN in predictions
-                if torch.isnan(predicted_consistency).any():
-                    logger.warning(f"NaN detected in predictions for example {i}")
+        # Training phase
+        model.train()
+        train_loss = 0
+        train_correct = 0
+        train_total = 0
+        
+        # Process training data in batches
+        for i in range(0, len(train_data), batch_size):
+            batch_data = train_data[i:i + batch_size]
+            batch_loss = 0
+            
+            for example in batch_data:
+                try:
+                    # Get training data
+                    question = example['question']
+                    search_context = example['search_context']
+                    consistency_label = example['consistency_label']
+                    
+                    # Create input
+                    inputs = create_training_input(question, search_context, tokenizer)
+                    
+                    # Move to device
+                    device = next(model.parameters()).device
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                    consistency_label = torch.tensor([[consistency_label]], dtype=torch.float32).to(device)
+                    
+                    # Forward pass
+                    outputs = model(**inputs)
+                    predicted_consistency = outputs['consistency_score']
+                    
+                    # Debug: Check for NaN in predictions
+                    if torch.isnan(predicted_consistency).any():
+                        logger.warning(f"NaN detected in predictions")
+                        continue
+                    
+                    # Calculate loss
+                    loss = consistency_loss_fn(predicted_consistency, consistency_label)
+                    
+                    # Debug: Check for NaN in loss
+                    if torch.isnan(loss):
+                        logger.warning(f"NaN loss detected, predicted: {predicted_consistency.item():.6f}, target: {consistency_label.item():.6f}")
+                        continue
+                    
+                    batch_loss += loss
+                    
+                    # Count correct predictions (threshold at 0.5)
+                    pred_binary = (predicted_consistency > 0.5).float()
+                    target_binary = (consistency_label > 0.5).float()
+                    train_correct += (pred_binary == target_binary).sum().item()
+                    train_total += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error processing training example: {e}")
                     continue
-                
-                # Calculate loss
-                loss = consistency_loss_fn(predicted_consistency, consistency_label)
-                
-                # Debug: Check for NaN in loss
-                if torch.isnan(loss):
-                    logger.warning(f"NaN loss detected for example {i}, predicted: {predicted_consistency.item():.6f}, target: {consistency_label.item():.6f}")
-                    continue
-                
-                # Backward pass
+            
+            # Backward pass for batch
+            if batch_loss > 0:
                 optimizer.zero_grad()
-                loss.backward()
+                batch_loss.backward()
                 
                 # Gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(model.consistency_head.parameters(), max_norm=0.1)
+                torch.nn.utils.clip_grad_norm_(model.consistency_head.parameters(), max_norm=1.0)
                 
                 optimizer.step()
-                
-                epoch_loss += loss.item()
-                
-                if i % 10 == 0:
-                    logger.info(f"Example {i}: Loss = {loss.item():.4f}, "
-                              f"Predicted = {predicted_consistency.item():.4f}, "
-                              f"Target = {consistency_label.item():.4f}")
-                
-            except Exception as e:
-                logger.error(f"Error processing example {i}: {e}")
-                continue
+                train_loss += batch_loss.item()
         
-        avg_epoch_loss = epoch_loss / len(training_data)
-        total_loss += avg_epoch_loss
-        logger.info(f"Epoch {epoch + 1} average loss: {avg_epoch_loss:.4f}")
-    
-    # Save the trained consistency head
-    logger.info(f"Saving trained consistency head to {save_path}")
-    torch.save(model.consistency_head.state_dict(), save_path)
+        avg_train_loss = train_loss / (len(train_data) // batch_size + 1)
+        train_accuracy = train_correct / train_total if train_total > 0 else 0
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for example in val_data:
+                try:
+                    # Get validation data
+                    question = example['question']
+                    search_context = example['search_context']
+                    consistency_label = example['consistency_label']
+                    
+                    # Create input
+                    inputs = create_training_input(question, search_context, tokenizer)
+                    
+                    # Move to device
+                    device = next(model.parameters()).device
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                    consistency_label = torch.tensor([[consistency_label]], dtype=torch.float32).to(device)
+                    
+                    # Forward pass
+                    outputs = model(**inputs)
+                    predicted_consistency = outputs['consistency_score']
+                    
+                    # Calculate loss
+                    loss = consistency_loss_fn(predicted_consistency, consistency_label)
+                    val_loss += loss.item()
+                    
+                    # Count correct predictions
+                    pred_binary = (predicted_consistency > 0.5).float()
+                    target_binary = (consistency_label > 0.5).float()
+                    val_correct += (pred_binary == target_binary).sum().item()
+                    val_total += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error processing validation example: {e}")
+                    continue
+        
+        avg_val_loss = val_loss / len(val_data) if val_data else 0
+        val_accuracy = val_correct / val_total if val_total > 0 else 0
+        
+        # Update learning rate scheduler
+        scheduler.step(avg_val_loss)
+        
+        logger.info(f"Epoch {epoch + 1}: Train Loss = {avg_train_loss:.4f}, Train Acc = {train_accuracy:.4f}, "
+                   f"Val Loss = {avg_val_loss:.4f}, Val Acc = {val_accuracy:.4f}, "
+                   f"LR = {optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Early stopping
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # Save best model
+            logger.info(f"New best validation loss: {best_val_loss:.4f}")
+            torch.save(model.consistency_head.state_dict(), save_path)
+        else:
+            patience_counter += 1
+            logger.info(f"Validation loss didn't improve. Patience: {patience_counter}/{early_stopping_patience}")
+            
+            if patience_counter >= early_stopping_patience:
+                logger.info("Early stopping triggered!")
+                break
     
     logger.info("Training completed!")
+    logger.info(f"Best validation loss: {best_val_loss:.4f}")
 
 def main():
     parser = argparse.ArgumentParser(description="Train consistency head on 32B model")
@@ -238,16 +324,20 @@ def main():
                        help="Path to extracted training data")
     parser.add_argument("--save_path", type=str, default="./trained_consistency_head.pt",
                        help="Path to save trained consistency head")
-    parser.add_argument("--num_epochs", type=int, default=3,
+    parser.add_argument("--num_epochs", type=int, default=10,
                        help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=1,
+    parser.add_argument("--batch_size", type=int, default=4,
                        help="Batch size for training")
-    parser.add_argument("--learning_rate", type=float, default=1e-5,
+    parser.add_argument("--learning_rate", type=float, default=3e-4,
                        help="Learning rate for consistency head")
     parser.add_argument("--use_quantization", action="store_true",
                        help="Use 4-bit quantization")
     parser.add_argument("--use_multi_gpu", action="store_true",
                        help="Use multiple GPUs for model loading")
+    parser.add_argument("--validation_split", type=float, default=0.2,
+                       help="Fraction of data to use for validation")
+    parser.add_argument("--early_stopping_patience", type=int, default=3,
+                       help="Number of epochs to wait before early stopping")
     
     args = parser.parse_args()
     
@@ -281,7 +371,8 @@ def main():
     train_consistency_head(
         model, tokenizer, training_data,
         args.num_epochs, args.batch_size,
-        args.learning_rate, args.save_path
+        args.learning_rate, args.save_path,
+        args.validation_split, args.early_stopping_patience
     )
 
 if __name__ == "__main__":
