@@ -573,7 +573,8 @@ def create_model_knowledge_fallback_entries(
     sequences_to_skip_retrieval: List[int],
     active_sequences: List[Dict[str, Any]],
     reasoner_outputs: List[Dict[str, Any]],
-    consistency_scores: List[float]
+    consistency_scores: List[float],
+    turn: int
 ) -> List[Dict[str, Any]]:
     """Create retrieval history entries for model knowledge fallback case."""
     retrieval_history_entries = []
@@ -596,7 +597,8 @@ def create_model_knowledge_fallback_entries(
                 "prompt_and_output": f"Model knowledge fallback - Consistency score: {consistency_score:.4f}\n\n{generated}",
                 "summarization_method": "model_knowledge_fallback",
                 "consistency_score": consistency_score,
-                "retrieval_method": "model_knowledge"
+                "retrieval_method": "model_knowledge",
+                "turn": turn
             })
     
     return retrieval_history_entries
@@ -991,7 +993,7 @@ def main(cfg: Any) -> None:
                 # Fall back to per-document summarization
                 retrieval_history_entries = process_per_document_summarization(
                     search_queries, search_results, summarizer_user_message_template,
-                    summarizer_model, summarizer_sampling_params, summarizer_tokenizer, use_openai_summarizer
+                    summarizer_model, summarizer_sampling_params, summarizer_tokenizer, use_openai_summarizer, turn
                 )
                 retrieval_history.extend(retrieval_history_entries)
                 
@@ -1036,11 +1038,8 @@ def main(cfg: Any) -> None:
                 seq["finished"] = True
                 seq["answer"] = ""
 
-    # Create model knowledge fallback entries
-    model_knowledge_fallback_entries = create_model_knowledge_fallback_entries(
-        sequences_to_skip_retrieval, active_sequences, reasoner_outputs, consistency_scores
-    )
-    retrieval_history.extend(model_knowledge_fallback_entries)
+    # Model knowledge fallback entries are already created during the loop
+    # No need to create them again here
 
     # Shutdown models
     if reasoner_model is not None:
