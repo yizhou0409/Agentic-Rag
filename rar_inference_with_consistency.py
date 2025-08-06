@@ -66,24 +66,34 @@ class ConsistencyHead(nn.Module):
             self.layers.append(layer)
     
     def forward(self, hidden_states, target_positions=None):
+        # Ensure we have the target layer
+        if self.target_layer >= len(hidden_states):
+            logger.warning(f"Target layer {self.target_layer} is out of bounds. Using last layer {len(hidden_states)-1}")
+            target_layer_idx = len(hidden_states) - 1
+        else:
+            target_layer_idx = self.target_layer
+        
+        # Get the target layer hidden states
+        target_layer_hidden = hidden_states[target_layer_idx]
+        
         # If target_positions is provided, use those specific positions
         # Otherwise, fall back to the last token (for backward compatibility)
         if target_positions is not None:
             # Extract hidden states at specific target positions
-            batch_size = hidden_states[self.target_layer].shape[0]
-            target_hidden = torch.zeros(batch_size, hidden_states[self.target_layer].shape[-1], 
-                                      device=hidden_states[self.target_layer].device, 
-                                      dtype=hidden_states[self.target_layer].dtype)
+            batch_size = target_layer_hidden.shape[0]
+            target_hidden = torch.zeros(batch_size, target_layer_hidden.shape[-1], 
+                                      device=target_layer_hidden.device, 
+                                      dtype=target_layer_hidden.dtype)
             
             for i, pos in enumerate(target_positions):
-                if pos < hidden_states[self.target_layer].shape[1]:
-                    target_hidden[i] = hidden_states[self.target_layer][i, pos, :]
+                if pos < target_layer_hidden.shape[1]:
+                    target_hidden[i] = target_layer_hidden[i, pos, :]
                 else:
                     # Fallback to last position if target position is out of bounds
-                    target_hidden[i] = hidden_states[self.target_layer][i, -1, :]
+                    target_hidden[i] = target_layer_hidden[i, -1, :]
         else:
             # Take the last token's hidden state from the target layer (original behavior)
-            target_hidden = hidden_states[self.target_layer][:, -1, :]
+            target_hidden = target_layer_hidden[:, -1, :]
         
         # Pass through all layers
         x = target_hidden
@@ -109,8 +119,13 @@ class ModelWithConsistencyHead(nn.Module):
         # Get base model outputs
         outputs = self.base_model(**kwargs, output_hidden_states=True)
         
-        # Convert all hidden states to float32
-        hidden_states = [hs.to(dtype=torch.float32) for hs in outputs.hidden_states]
+        # Convert all hidden states to float32 and ensure they're on the same device as consistency head
+        consistency_head_device = next(self.consistency_head.parameters()).device
+        hidden_states = []
+        for hs in outputs.hidden_states:
+            # Move hidden states to the same device as consistency head and convert to float32
+            hs_processed = hs.to(device=consistency_head_device, dtype=torch.float32)
+            hidden_states.append(hs_processed)
         
         # Predict consistency score with target positions
         consistency_score = self.consistency_head(hidden_states, target_positions)
@@ -129,6 +144,8 @@ def load_model_with_consistency_head(
 ):
     """Load model with consistency head."""
     logger.info(f"Loading model from {model_path}...")
+    logger.info(f"Use quantization: {use_quantization}")
+    logger.info(f"Use multi-GPU: {use_multi_gpu}")
     
     # Set up quantization if requested
     if use_quantization:
@@ -143,21 +160,66 @@ def load_model_with_consistency_head(
     else:
         quantization_config = None
     
-    # Load base model with explicit single device mapping
-    if use_multi_gpu:
-        device_map = {"": 0}  # Put ALL layers on GPU 0
+    # Set up device mapping for multi-GPU or single GPU
+    if use_multi_gpu and torch.cuda.device_count() > 1:
+        # Get available GPU memory and distribute layers across GPUs
+        num_gpus = torch.cuda.device_count()
+        logger.info(f"Using {num_gpus} GPUs for model distribution")
+        
+        # Create device map for multi-GPU distribution
+        # This will automatically distribute layers across available GPUs
+        device_map = "auto"
+        
+        # Set memory limits for each GPU (leave some memory for consistency head)
+        max_memory = {}
+        for i in range(num_gpus):
+            # Get total GPU memory and reserve some for consistency head
+            gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # Convert to GB
+            reserved_memory = 3.0  # Reserve 3GB for consistency head and other operations
+            available_memory = max(1.0, gpu_memory - reserved_memory)  # Ensure at least 1GB is available
+            max_memory[i] = f"{available_memory:.0f}GB"
+        
+        logger.info(f"Memory allocation per GPU: {max_memory}")
     else:
-        device_map = {"": 0}  # Put ALL layers on GPU 0
+        # Single GPU or CPU
+        device_map = {"": 0}
+        max_memory = {0: "75GB"} if torch.cuda.is_available() else None
+        logger.info("Using single GPU or CPU")
     
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        quantization_config=quantization_config,
-        device_map=device_map,
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-        # Force everything on GPU only
-        max_memory={0: "75GB"}  # Use most of GPU memory, no CPU
-    )
+    # Load base model
+    try:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=quantization_config,
+            device_map=device_map,
+            torch_dtype=torch.float16 if not use_quantization else None,
+            trust_remote_code=True,
+            max_memory=max_memory if use_multi_gpu else max_memory
+        )
+        logger.info("Base model loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load base model: {str(e)}")
+        if use_multi_gpu and not use_quantization:
+            logger.info("Trying fallback: single GPU with quantization")
+            # Fallback to single GPU with quantization
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                quantization_config=BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_storage=torch.float16,
+                    llm_int8_threshold=6.0,
+                ),
+                device_map={"": 0},
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                max_memory={0: "75GB"}
+            )
+            logger.info("Base model loaded with fallback configuration")
+        else:
+            raise e
     
     # Get hidden size from model
     hidden_size = base_model.config.hidden_size
@@ -180,8 +242,14 @@ def load_model_with_consistency_head(
     # Create wrapper model
     model = ModelWithConsistencyHead(base_model, consistency_head)
     
-    # Move to GPU if available
-    if torch.cuda.is_available():
+    # Handle device placement for consistency head
+    if use_multi_gpu and torch.cuda.device_count() > 1:
+        # For multi-GPU, place consistency head on the first GPU
+        # This ensures it can access the hidden states from the distributed model
+        device = torch.device("cuda:0")
+        model.consistency_head = model.consistency_head.to(device)
+        logger.info(f"Consistency head moved to {device}")
+    elif torch.cuda.is_available():
         device = torch.device("cuda")
         model = model.to(device)
         logger.info("Model moved to GPU")
@@ -198,6 +266,41 @@ def load_model_with_consistency_head(
     logger.info("Base model parameters frozen, only consistency head will be used for inference")
     
     return model, device
+
+def validate_model_loading(model, device, use_multi_gpu):
+    """Validate that the model was loaded correctly and can handle inference."""
+    logger.info("Validating model loading...")
+    
+    try:
+        # Test a simple forward pass with dummy data
+        dummy_input = torch.randint(0, 1000, (1, 10), device=device)
+        
+        with torch.no_grad():
+            outputs = model(input_ids=dummy_input)
+        
+        logger.info("Model validation successful - forward pass works")
+        
+        # Check if consistency head is accessible
+        if hasattr(model, 'consistency_head'):
+            consistency_score = outputs.get('consistency_score')
+            if consistency_score is not None:
+                logger.info(f"Consistency head working - output shape: {consistency_score.shape}")
+            else:
+                logger.warning("Consistency head output not found in model outputs")
+        
+        # Log device information
+        if use_multi_gpu and torch.cuda.device_count() > 1:
+            logger.info("Multi-GPU setup detected")
+            for i in range(torch.cuda.device_count()):
+                gpu_memory_used = torch.cuda.memory_allocated(i) / (1024**3)
+                gpu_memory_total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                logger.info(f"GPU {i}: {gpu_memory_used:.2f}GB / {gpu_memory_total:.2f}GB used")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Model validation failed: {str(e)}")
+        return False
 
 def find_closing_search_position(text: str, tokenizer: AutoTokenizer) -> int:
     """Find the position of the '>' token at the end of </search>."""
@@ -585,12 +688,15 @@ def create_model_knowledge_fallback_entries(
             output = reasoner_outputs[i]
             consistency_score = consistency_scores[i] if i < len(consistency_scores) else 0.0
             
-            # Extract the search query and reasoning from the output
+            # Get the search query that was stored when the sequence was marked for skipping
+            search_q = seq.get("model_knowledge_search_query", "No search query stored")
+            
+            # Extract the reasoning from the output
             generated = output["text"]
-            thought, search_q, answer = parse_reasoning_generation(generated)
+            thought, _, answer = parse_reasoning_generation(generated)
             
             retrieval_history_entries.append({
-                "query": search_q if search_q else "No search query generated",
+                "query": search_q,
                 "retrieved_documents": [],  # No documents retrieved
                 "final_summary": "Used model's direct knowledge",
                 "final_summary_raw_output": generated,
@@ -634,6 +740,7 @@ def save_outputs(
         json.dump(outputs, f, indent=2)
     
     # Save retrieval history
+    logger.info(f"Saving {len(retrieval_history)} retrieval history entries")
     retrieval_history_file_name = f'retrieval_history_{timestamp}.json'
     with open(f"{output_dir}/{retrieval_history_file_name}", "w") as f:
         json.dump(retrieval_history, f, indent=2)
@@ -688,6 +795,17 @@ def main(cfg: Any) -> None:
     logger.info("***Experiment Config***")
     logger.info(OmegaConf.to_yaml(cfg))
     logger.info("***********************")
+    
+    # Log GPU information
+    if torch.cuda.is_available():
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        logger.info(f"Number of GPUs: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            gpu_name = torch.cuda.get_device_name(i)
+            gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+            logger.info(f"GPU {i}: {gpu_name}, Memory: {gpu_memory:.1f}GB")
+    else:
+        logger.info("CUDA not available, using CPU")
 
     # Load dataset
     dataset_path = os.path.join(cfg.data.dataset_root_dir, cfg.data.dataset_name, f"{cfg.data.dataset_split}.jsonl")
@@ -714,13 +832,22 @@ def main(cfg: Any) -> None:
     if not use_openai_reasoner:
         consistency_head_path = cfg.model.get('consistency_head_path', './trained_consistency_head_40.pt')
         target_layer = cfg.model.get('target_layer', 40)
+        # Get model loading settings from config
+        use_quantization = cfg.model.get('use_quantization', False)
+        use_multi_gpu = cfg.model.get('use_multi_gpu', True)
+        
         consistency_model, device = load_model_with_consistency_head(
             cfg.model.reasoner_name_or_path,
             consistency_head_path,
-            use_quantization=True,
-            use_multi_gpu=True,  # Use multi-GPU for better memory management
+            use_quantization=use_quantization,
+            use_multi_gpu=use_multi_gpu,
             target_layer=target_layer
         )
+        
+        # Validate the loaded model
+        if not validate_model_loading(consistency_model, device, use_multi_gpu):
+            logger.error("Model validation failed. Please check your configuration and GPU setup.")
+            raise RuntimeError("Model validation failed")
     
     reasoner_model = GeneratorMixin(
         mode=cfg.model.reasoner_mode,
@@ -852,51 +979,46 @@ def main(cfg: Any) -> None:
             thought, search_q, answer = parse_reasoning_generation(generated)
             
             if search_q:
+                logger.info(f"Sequence {i} generated search query: {search_q}")
                 # Check if we should use consistency head to decide on retrieval
                 if not use_openai_reasoner and consistency_model is not None:
-                    # Find the position of the '>' token at the end of </search>
-                    closing_pos = find_closing_search_position(generated, reasoner_tokenizer)
-                    
-                    if closing_pos >= 0:
-                        # Get the full text up to the closing position
-                        full_text = seq["prompt"] + generated
-                        tokens = reasoner_tokenizer.encode(full_text)
+                    try:
+                        # Find the position of the '>' token at the end of </search>
+                        closing_pos = find_closing_search_position(generated, reasoner_tokenizer)
                         
-                        if closing_pos < len(tokens):
-                            # Create input for consistency head
-                            input_ids = torch.tensor([tokens], device=device)
+                        if closing_pos >= 0:
+                            # Get the full text up to the closing position
+                            full_text = seq["prompt"] + generated
+                            tokens = reasoner_tokenizer.encode(full_text)
                             
-                            with torch.no_grad():
-                                outputs = consistency_model(
-                                    input_ids=input_ids,
-                                    target_positions=[closing_pos]
-                                )
-                                consistency_score = outputs["consistency_score"].item()
-                            
-                            logger.info(f"Consistency score for sequence {i}: {consistency_score:.4f}")
-                            
-                            # If consistency score is high, skip retrieval and let reasoner answer directly
-                            if consistency_score > consistency_threshold:
-                                logger.info(f"High consistency score ({consistency_score:.4f} > {consistency_threshold}), skipping retrieval for sequence {i}")
-                                sequences_to_skip_retrieval.append(i)
-                                consistency_scores.append(consistency_score) # Store for fallback
+                            if closing_pos < len(tokens):
+                                # Create input for consistency head
+                                input_ids = torch.tensor([tokens], device=device)
                                 
-                                # Create model knowledge fallback entry immediately
-                                fallback_entry = {
-                                    "query": search_q,
-                                    "retrieved_documents": [],  # No documents retrieved
-                                    "final_summary": "Used model's direct knowledge",
-                                    "final_summary_raw_output": generated,
-                                    "prompt_and_output": f"Model knowledge fallback - Consistency score: {consistency_score:.4f}\n\n{generated}",
-                                    "summarization_method": "model_knowledge_fallback",
-                                    "consistency_score": consistency_score,
-                                    "retrieval_method": "model_knowledge",
-                                    "turn": turn
-                                }
-                                retrieval_history.append(fallback_entry)
+                                with torch.no_grad():
+                                    outputs = consistency_model(
+                                        input_ids=input_ids,
+                                        target_positions=[closing_pos]
+                                    )
+                                    consistency_score = outputs["consistency_score"].item()
                                 
-                                # Continue generation to get answer
-                                continue
+                                logger.info(f"Consistency score for sequence {i}: {consistency_score:.4f}")
+                                
+                                # If consistency score is high, skip retrieval and let reasoner answer directly
+                                if consistency_score > consistency_threshold:
+                                    logger.info(f"High consistency score ({consistency_score:.4f} > {consistency_threshold}), skipping retrieval for sequence {i}")
+                                    sequences_to_skip_retrieval.append(i)
+                                    consistency_scores.append(consistency_score) # Store for fallback
+                                    
+                                    # Store the search query for model knowledge fallback recording
+                                    seq["model_knowledge_search_query"] = search_q
+                                    
+                                    # Continue generation to get answer
+                                    continue
+                    except Exception as e:
+                        logger.warning(f"Error in consistency head inference for sequence {i}: {str(e)}")
+                        logger.warning("Continuing with normal retrieval flow")
+                        # Continue with normal retrieval if consistency head fails
                 
                 search_queries.append(search_q)
                 if use_openai_reasoner:
@@ -904,11 +1026,29 @@ def main(cfg: Any) -> None:
                 else:
                     seq["prompt"] += generated.rstrip()
             elif answer:
+                logger.info(f"Sequence {i} generated answer: {answer}")
                 seq["finished"] = True
                 seq["answer"] = answer
             else:
+                logger.info(f"Sequence {i} generated no search query or answer")
                 seq["finished"] = True
                 seq["answer"] = ""
+        
+        logger.info(f"Total search queries collected: {len(search_queries)}")
+        logger.info(f"Sequences to skip retrieval: {sequences_to_skip_retrieval}")
+        
+        # Collect all search queries including those that will use model knowledge
+        all_search_queries = []
+        all_search_queries.extend(search_queries)
+        
+        # Add search queries from sequences that will use model knowledge
+        for i in sequences_to_skip_retrieval:
+            if i < len(active_sequences):
+                seq = active_sequences[i]
+                if "model_knowledge_search_query" in seq:
+                    all_search_queries.append(seq["model_knowledge_search_query"])
+        
+        logger.info(f"Total search queries (including model knowledge): {len(all_search_queries)}")
         
         # Filter out sequences that should skip retrieval
         filtered_active_sequences = []
@@ -919,15 +1059,35 @@ def main(cfg: Any) -> None:
                 filtered_active_sequences.append(seq)
                 filtered_search_queries.append(search_q)
         
+        logger.info(f"Filtered search queries: {len(filtered_search_queries)}")
+        
         active_sequences = [seq for seq in active_sequences if not seq["finished"]]
         search_queries = filtered_search_queries
 
         # Retrieval and summarization
         if search_queries:
+            logger.info(f"Processing {len(search_queries)} search queries for retrieval")
             start_search_time = time.time()
             search_results = retriever.batch_search(search_queries)
             ret_time = time.time() - start_search_time
             logger.info(f"Retrieval time: {ret_time:.2f} seconds")
+            logger.info(f"Retrieved {len(search_results)} result sets")
+            
+            # Map search results back to original sequence indices
+            # This ensures that search_results[i] corresponds to the correct sequence
+            original_search_results = []
+            result_idx = 0
+            for i in range(len(active_sequences)):
+                if i not in sequences_to_skip_retrieval:
+                    if result_idx < len(search_results):
+                        original_search_results.append(search_results[result_idx])
+                        result_idx += 1
+                    else:
+                        original_search_results.append([])
+                else:
+                    original_search_results.append([])  # Empty results for skipped sequences
+            
+            search_results = original_search_results
 
             # Try simple summarization first
             summarizer_prompt = build_summarizer_prompt(
@@ -976,9 +1136,11 @@ def main(cfg: Any) -> None:
             
             if summary_outputs:
                 # Simple summarization worked
+                logger.info(f"Creating simple retrieval history entries for {len(search_queries)} queries")
                 retrieval_history_entries = create_simple_retrieval_history_entries(
                     search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output, turn
                 )
+                logger.info(f"Created {len(retrieval_history_entries)} retrieval history entries")
                 retrieval_history.extend(retrieval_history_entries)
                 
                 for seq, entry in zip(filtered_active_sequences, retrieval_history_entries):
@@ -991,10 +1153,12 @@ def main(cfg: Any) -> None:
                     seq["output"] += append_summary
             else:
                 # Fall back to per-document summarization
+                logger.info(f"Creating per-document retrieval history entries for {len(search_queries)} queries")
                 retrieval_history_entries = process_per_document_summarization(
                     search_queries, search_results, summarizer_user_message_template,
                     summarizer_model, summarizer_sampling_params, summarizer_tokenizer, use_openai_summarizer, turn
                 )
+                logger.info(f"Created {len(retrieval_history_entries)} per-document retrieval history entries")
                 retrieval_history.extend(retrieval_history_entries)
                 
                 for seq, entry in zip(filtered_active_sequences, retrieval_history_entries):
@@ -1005,6 +1169,28 @@ def main(cfg: Any) -> None:
                     else:
                         seq["prompt"] += append_summary
                     seq["output"] += append_summary
+
+        # Create model knowledge fallback entries for this turn
+        # These entries record search queries that were solved using the model's knowledge instead of retrieval
+        if sequences_to_skip_retrieval:
+            logger.info(f"Creating model knowledge fallback entries for {len(sequences_to_skip_retrieval)} sequences")
+            # Get the reasoner outputs for sequences that skipped retrieval
+            skip_reasoner_outputs = []
+            for i in sequences_to_skip_retrieval:
+                if i < len(reasoner_outputs):
+                    skip_reasoner_outputs.append(reasoner_outputs[i])
+                else:
+                    skip_reasoner_outputs.append({"text": "No output available"})
+            
+            fallback_entries = create_model_knowledge_fallback_entries(
+                sequences_to_skip_retrieval, active_sequences, skip_reasoner_outputs, consistency_scores, turn
+            )
+            logger.info(f"Created {len(fallback_entries)} model knowledge fallback entries")
+            retrieval_history.extend(fallback_entries)
+            
+            # Clear the skip lists for next turn
+            sequences_to_skip_retrieval.clear()
+            consistency_scores.clear()
 
     # Force finish remaining sequences
     logger.info("-------- Turn limit reached. Forcing active sequences to finish. --------")
