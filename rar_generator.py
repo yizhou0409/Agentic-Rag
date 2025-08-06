@@ -160,8 +160,8 @@ class GeneratorMixin:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
             # Determine device map based on quantization
-            device_map = "auto"
-            max_memory = {0: "15GB"} if quantization_type == 'int8' else None
+            device_map = {"": 0}  # Force everything on GPU 0
+            max_memory = {0: "75GB"} if quantization_type == 'int8' else {0: "75GB"}
             
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name_or_path,

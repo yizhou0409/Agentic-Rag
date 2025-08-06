@@ -512,7 +512,8 @@ def process_per_document_summarization(
                 agg_prompt if summarizer_tokenizer is None 
                 else agg_prompt + "\n\n[OUTPUT STARTS HERE]\n\n" + final_analysis + "\n\n" + final_summary
             ),
-            "summarization_method": "fallback"
+            "summarization_method": "fallback",
+            "retrieval_method": "normal_retrieval"
         })
     
     return retrieval_history_entries
@@ -558,8 +559,41 @@ def create_simple_retrieval_history_entries(
             "prompt_and_output": (
                 str(prompt) + "\n\n[OUTPUT STARTS HERE]\n\n" + summary_output[0] + "\n\n" + summary_output[1]
             ),
-            "summarization_method": "simple"
+            "summarization_method": "simple",
+            "retrieval_method": "normal_retrieval"
         })
+    
+    return retrieval_history_entries
+
+def create_model_knowledge_fallback_entries(
+    sequences_to_skip_retrieval: List[int],
+    active_sequences: List[Dict[str, Any]],
+    reasoner_outputs: List[Dict[str, Any]],
+    consistency_scores: List[float]
+) -> List[Dict[str, Any]]:
+    """Create retrieval history entries for model knowledge fallback case."""
+    retrieval_history_entries = []
+    
+    for i in sequences_to_skip_retrieval:
+        if i < len(active_sequences) and i < len(reasoner_outputs):
+            seq = active_sequences[i]
+            output = reasoner_outputs[i]
+            consistency_score = consistency_scores[i] if i < len(consistency_scores) else 0.0
+            
+            # Extract the search query and reasoning from the output
+            generated = output["text"]
+            thought, search_q, answer = parse_reasoning_generation(generated)
+            
+            retrieval_history_entries.append({
+                "query": search_q if search_q else "No search query generated",
+                "retrieved_documents": [],  # No documents retrieved
+                "final_summary": "Used model's direct knowledge",
+                "final_summary_raw_output": generated,
+                "prompt_and_output": f"Model knowledge fallback - Consistency score: {consistency_score:.4f}\n\n{generated}",
+                "summarization_method": "model_knowledge_fallback",
+                "consistency_score": consistency_score,
+                "retrieval_method": "model_knowledge"
+            })
     
     return retrieval_history_entries
 
@@ -804,6 +838,7 @@ def main(cfg: Any) -> None:
         # Process reasoner outputs and check consistency
         search_queries = []
         sequences_to_skip_retrieval = []
+        consistency_scores = [] # Track consistency scores for fallback
         
         for i, (seq, out) in enumerate(zip(active_sequences, reasoner_outputs)):
             generated = out["text"]
@@ -838,6 +873,7 @@ def main(cfg: Any) -> None:
                             if consistency_score > consistency_threshold:
                                 logger.info(f"High consistency score ({consistency_score:.4f} > {consistency_threshold}), skipping retrieval for sequence {i}")
                                 sequences_to_skip_retrieval.append(i)
+                                consistency_scores.append(consistency_score) # Store for fallback
                                 # Continue generation to get answer
                                 continue
                 
@@ -980,6 +1016,12 @@ def main(cfg: Any) -> None:
             else:
                 seq["finished"] = True
                 seq["answer"] = ""
+
+    # Create model knowledge fallback entries
+    model_knowledge_fallback_entries = create_model_knowledge_fallback_entries(
+        sequences_to_skip_retrieval, active_sequences, reasoner_outputs, consistency_scores
+    )
+    retrieval_history.extend(model_knowledge_fallback_entries)
 
     # Shutdown models
     if reasoner_model is not None:

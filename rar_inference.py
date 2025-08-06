@@ -327,7 +327,56 @@ def process_per_document_summarization(
             "prompt_and_output": (
                 agg_prompt if summarizer_tokenizer is None 
                 else agg_prompt + "\n\n[OUTPUT STARTS HERE]\n\n" + final_analysis + "\n\n" + final_summary
-            )
+            ),
+            "summarization_method": "fallback",
+            "retrieval_method": "normal_retrieval"
+        })
+    
+    return retrieval_history_entries
+
+def create_simple_retrieval_history_entries(
+    search_queries: List[str],
+    search_results: List[List[Dict[str, Any]]],
+    summary_outputs: List[Tuple[str, str]],
+    summarizer_prompt_list: List[Union[str, List[Dict[str, str]]]],
+    summarizer_output: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Create retrieval history entries for simple summarization case."""
+    retrieval_history_entries = []
+    
+    for i, (query, results, summary_output, prompt, raw_output) in enumerate(zip(
+        search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output
+    )):
+        # Format documents for history
+        formatted_docs = []
+        for doc in results:
+            if 'title' in doc and 'text' in doc:
+                doc_title = doc['title']
+                doc_text = doc['text']
+            elif 'title' in doc and 'contents' in doc:
+                doc_title = doc['title']
+                doc_text = doc['contents']
+            elif 'text' in doc:
+                doc_title = ''
+                doc_text = doc['text']
+            elif 'contents' in doc:
+                doc_title = ''
+                doc_text = doc['contents']
+            else:
+                doc_title = ''
+                doc_text = str(doc)
+            formatted_docs.append(f"Document (Title: {doc_title}): {doc_text}")
+        
+        retrieval_history_entries.append({
+            "query": query,
+            "retrieved_documents": formatted_docs,
+            "final_summary": summary_output[1].strip(),
+            "final_summary_raw_output": raw_output["text"],
+            "prompt_and_output": (
+                str(prompt) + "\n\n[OUTPUT STARTS HERE]\n\n" + summary_output[0] + "\n\n" + summary_output[1]
+            ),
+            "summarization_method": "simple",
+            "retrieval_method": "normal_retrieval"
         })
     
     return retrieval_history_entries
@@ -627,8 +676,13 @@ def main(cfg: Any) -> None:
             
             if summary_outputs:
                 # Simple summarization worked
-                for seq, out in zip(active_sequences, summary_outputs):
-                    summary = out[1].strip()
+                retrieval_history_entries = create_simple_retrieval_history_entries(
+                    search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output
+                )
+                retrieval_history.extend(retrieval_history_entries)
+                
+                for seq, entry in zip(active_sequences, retrieval_history_entries):
+                    summary = entry["final_summary"].strip()
                     append_summary = f"{BEGIN_OF_INFO} {summary} {END_OF_INFO}\n\n"
                     if use_openai_reasoner:
                         seq["messages"].append({"role": "user", "content": append_summary})
