@@ -99,7 +99,11 @@ class ModelWithConsistencyHead(nn.Module):
         hidden_states = []
         for hs in outputs.hidden_states:
             # Convert to float32 and move to consistency head device
-            hs_float32 = hs.to(dtype=torch.float32, device=consistency_head_device)
+            # Handle the case where hidden states might be on different devices
+            if hs.device != consistency_head_device:
+                hs_float32 = hs.to(dtype=torch.float32, device=consistency_head_device)
+            else:
+                hs_float32 = hs.to(dtype=torch.float32)
             hidden_states.append(hs_float32)
         
         # Predict consistency score with target positions
@@ -111,7 +115,7 @@ class ModelWithConsistencyHead(nn.Module):
         }
 
 def load_model(model_path: str, use_quantization: bool = False, use_multi_gpu: bool = True):
-    """Load model without quantization on 2 GPUs."""
+    """Load model without quantization on 2 GPUs using device_map."""
     
     logger.info(f"Loading model from {model_path}...")
     
@@ -130,10 +134,10 @@ def load_model(model_path: str, use_quantization: bool = False, use_multi_gpu: b
     
     # Configure device map for multi-GPU without quantization
     if use_multi_gpu and available_gpus >= 2:
-        # Use DataParallel for 2 GPUs without quantization
-        device_map = None  # Don't use device_map with DataParallel
-        max_memory = None
-        logger.info("Using DataParallel for 2 GPUs without quantization")
+        # Use device_map to distribute model across 2 GPUs
+        device_map = "auto"
+        max_memory = {0: "28GB", 1: "28GB", "cpu": "100GB"}
+        logger.info("Using device_map='auto' for 2 GPUs without quantization")
     else:
         device_map = "auto"
         max_memory = None
@@ -149,11 +153,6 @@ def load_model(model_path: str, use_quantization: bool = False, use_multi_gpu: b
         low_cpu_mem_usage=True
     )
     
-    # Apply DataParallel if using multi-GPU
-    if use_multi_gpu and available_gpus >= 2:
-        model = torch.nn.DataParallel(model, device_ids=[0, 1])
-        logger.info("Model wrapped with DataParallel for 2 GPUs")
-    
     logger.info("Model loaded successfully!")
     return model, tokenizer
 
@@ -161,22 +160,22 @@ def ensure_same_device(model: ModelWithConsistencyHead, device: torch.device):
     """Ensure all model components are on the same device."""
     logger.info(f"Moving all model components to device: {device}")
     
-    # Move base model to device
-    if hasattr(model.base_model, 'module'):  # DataParallel case
-        model.base_model.module = model.base_model.module.to(device)
-    else:
-        model.base_model = model.base_model.to(device)
+    # For device_map models, we need to be more careful about moving
+    # The base model might be distributed across multiple devices
+    # We'll move the consistency head to the target device and ensure
+    # the forward pass handles device placement properly
     
     # Move consistency head to device
     model.consistency_head = model.consistency_head.to(device)
     
-    # Ensure all parameters are on the same device
-    for name, param in model.named_parameters():
+    # Ensure consistency head parameters are on the target device
+    for name, param in model.consistency_head.named_parameters():
         if param.device != device:
-            logger.warning(f"Parameter {name} is on {param.device}, moving to {device}")
+            logger.warning(f"Consistency head parameter {name} is on {param.device}, moving to {device}")
             param.data = param.data.to(device)
     
-    logger.info("All model components moved to same device")
+    logger.info("Consistency head moved to target device")
+    logger.info("Note: Base model remains distributed across GPUs for memory efficiency")
 
 def prepare_training_data(training_data_path: str) -> List[Dict[str, Any]]:
     """Load and prepare training data."""
@@ -245,11 +244,7 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
     
     logger.info("Starting consistency head training...")
     
-    # Check if base model is using DataParallel
-    is_data_parallel = hasattr(model.base_model, 'module')
-    logger.info(f"Base model is using DataParallel: {is_data_parallel}")
-    
-    # Ensure all model components are on the same device
+    # Ensure consistency head is on the target device
     # Use GPU 0 as the primary device for training
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     ensure_same_device(model, device)
