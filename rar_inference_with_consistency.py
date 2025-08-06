@@ -435,7 +435,7 @@ def build_reasoner_prompt(
     sys_message: str, 
     user_message_template: str,
     cfg: Any,
-    reasoner_tokenizer: Optional[AutoTokenizer]
+    tokenizer: Optional[AutoTokenizer]
 ) -> Union[List[Dict[str, str]], Dict[str, str]]:
     """Build reasoner prompt based on model mode."""
     if cfg.model.reasoner_mode in ["openai", "proxy"]:
@@ -450,8 +450,8 @@ def build_reasoner_prompt(
             messages.append({"role": "system", "content": sys_message})
         messages.append({"role": "user", "content": user_message_template.format(question=item["question"])})
         
-        if reasoner_tokenizer is not None:
-            prompt = reasoner_tokenizer.apply_chat_template(
+        if tokenizer is not None:
+            prompt = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
@@ -466,7 +466,7 @@ def build_summarizer_prompt(
     user_message_template: str, 
     sys_message: Optional[str],
     cfg: Any,
-    summarizer_tokenizer: Optional[AutoTokenizer]
+    tokenizer: Optional[AutoTokenizer]
 ) -> Union[List[Dict[str, str]], Dict[str, str]]:
     """Build summarizer prompt based on model mode."""
     if cfg.model.summarizer_mode in ["openai", "proxy"]:
@@ -486,8 +486,8 @@ def build_summarizer_prompt(
         user_content = user_message_template.format(question=search_queries[0], documents=retrieved_context)
         messages = [{"role": "system", "content": user_content}]
         
-        if summarizer_tokenizer is not None:
-            prompt = summarizer_tokenizer.apply_chat_template(
+        if tokenizer is not None:
+            prompt = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
@@ -502,9 +502,10 @@ def process_per_document_summarization(
     summarizer_user_message_template: str,
     summarizer_model: GeneratorMixin,
     summarizer_sampling_params: Dict[str, Any],
-    summarizer_tokenizer: Optional[AutoTokenizer],
+    tokenizer: Optional[AutoTokenizer],
     use_openai_summarizer: bool,
-    turn: int
+    turn: int,
+    consistency_scores: List[float] = None
 ) -> List[Dict[str, Any]]:
     """Process per-document summarization and aggregation."""
     retrieval_history_entries = []
@@ -546,8 +547,8 @@ def process_per_document_summarization(
             )
             messages = [{"role": "system", "content": user_message}]
             
-            if summarizer_tokenizer is not None:
-                prompt = summarizer_tokenizer.apply_chat_template(
+            if tokenizer is not None:
+                prompt = tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
@@ -592,8 +593,8 @@ def process_per_document_summarization(
         
         agg_messages = [{"role": "system", "content": agg_user_message}]
         
-        if summarizer_tokenizer is not None:
-            agg_prompt = summarizer_tokenizer.apply_chat_template(
+        if tokenizer is not None:
+            agg_prompt = tokenizer.apply_chat_template(
                 agg_messages,
                 tokenize=False,
                 add_generation_prompt=True,
@@ -606,6 +607,10 @@ def process_per_document_summarization(
         final_summary_output_raw_tagged = f"### Extracted Information\n{final_summary_output_raw['text'].strip()}"
         final_analysis, final_summary = parse_summary_generation(final_summary_output_raw_tagged)
         
+        # Get consistency score for this query if available
+        query_index = search_queries.index(query)
+        consistency_score = consistency_scores[query_index] if consistency_scores and query_index < len(consistency_scores) else None
+        
         retrieval_history_entries.append({
             "query": query,
             "per_doc_summaries": per_doc_summaries,
@@ -613,11 +618,12 @@ def process_per_document_summarization(
             "final_summary": final_summary,
             "final_summary_raw_output": final_summary_output_raw['text'],
             "prompt_and_output": (
-                agg_prompt if summarizer_tokenizer is None 
+                agg_prompt if tokenizer is None 
                 else agg_prompt + "\n\n[OUTPUT STARTS HERE]\n\n" + final_analysis + "\n\n" + final_summary
             ),
             "summarization_method": "fallback",
             "retrieval_method": "normal_retrieval",
+            "consistency_score": consistency_score,
             "turn": turn
         })
     
@@ -629,7 +635,8 @@ def create_simple_retrieval_history_entries(
     summary_outputs: List[Tuple[str, str]],
     summarizer_prompt_list: List[Union[str, List[Dict[str, str]]]],
     summarizer_output: List[Dict[str, Any]],
-    turn: int
+    turn: int,
+    consistency_scores: List[float] = None
 ) -> List[Dict[str, Any]]:
     """Create retrieval history entries for simple summarization case."""
     retrieval_history_entries = []
@@ -657,6 +664,9 @@ def create_simple_retrieval_history_entries(
                 doc_text = str(doc)
             formatted_docs.append(f"Document (Title: {doc_title}): {doc_text}")
         
+        # Get consistency score for this query if available
+        consistency_score = consistency_scores[i] if consistency_scores and i < len(consistency_scores) else None
+        
         retrieval_history_entries.append({
             "query": query,
             "retrieved_documents": formatted_docs,
@@ -667,6 +677,7 @@ def create_simple_retrieval_history_entries(
             ),
             "summarization_method": "simple",
             "retrieval_method": "normal_retrieval",
+            "consistency_score": consistency_score,
             "turn": turn
         })
     
@@ -824,9 +835,10 @@ def main(cfg: Any) -> None:
     use_openai_reasoner = cfg.model.reasoner_mode == "openai"
     use_openai_summarizer = cfg.model.summarizer_mode == "openai"
     
-    reasoner_tokenizer = None if use_openai_reasoner else AutoTokenizer.from_pretrained(cfg.model.reasoner_name_or_path)
+    # Load single tokenizer for the model
+    tokenizer = None if use_openai_reasoner else AutoTokenizer.from_pretrained(cfg.model.reasoner_name_or_path)
     
-    # Load model with consistency head if using local model
+    # Load single model with consistency head if using local model
     consistency_model = None
     device = None
     if not use_openai_reasoner:
@@ -836,6 +848,8 @@ def main(cfg: Any) -> None:
         use_quantization = cfg.model.get('use_quantization', False)
         use_multi_gpu = cfg.model.get('use_multi_gpu', True)
         
+        logger.info("Loading single Qwen3-32B model with consistency head...")
+        logger.info("This model will be reused for reasoner and summarizer tasks - no additional model loading!")
         consistency_model, device = load_model_with_consistency_head(
             cfg.model.reasoner_name_or_path,
             consistency_head_path,
@@ -848,21 +862,152 @@ def main(cfg: Any) -> None:
         if not validate_model_loading(consistency_model, device, use_multi_gpu):
             logger.error("Model validation failed. Please check your configuration and GPU setup.")
             raise RuntimeError("Model validation failed")
+        
+        logger.info("Single model loaded successfully - will be reused for reasoner and summarizer")
     
-    reasoner_model = GeneratorMixin(
-        mode=cfg.model.reasoner_mode,
-        server_url=cfg.model.reasoner_url,
-        model_name_or_path=cfg.model.reasoner_name_or_path,
-        server_params=OmegaConf.to_container(cfg.inference.server_params),
-    )
+    # Create reasoner and summarizer models that reuse the same loaded model
+    if not use_openai_reasoner and consistency_model is not None:
+        # Create custom generators that reuse the loaded model
+        from rar_generator import GeneratorMixin
+        
+        class ReuseModelGeneratorMixin(GeneratorMixin):
+            """GeneratorMixin that reuses an already loaded model."""
+            
+            def __init__(self, mode: str, loaded_model, loaded_tokenizer, device, **kwargs):
+                self.mode = mode
+                self.model = loaded_model.base_model  # Use the base model from consistency model
+                self.tokenizer = loaded_tokenizer
+                self.device = device
+                self.server_url = kwargs.get('server_url')
+                self.server_params = kwargs.get('server_params', {})
+                
+                # Skip the normal initialization that would load a new model
+                logger.info(f"Reusing loaded model for {mode} generator")
+            
+            def _init_offline_model(self):
+                """Skip model loading since we're reusing an existing model."""
+                pass
+            
+            def _init_transformers_pipeline(self):
+                """Skip pipeline initialization since we're reusing an existing model."""
+                pass
+            
+            def generate(self, prompts, sampling_params=None):
+                """Generate using the reused model."""
+                if sampling_params is None:
+                    sampling_params = {}
+                
+                # Convert prompts to the format expected by the model
+                if isinstance(prompts[0], dict) and 'messages' in prompts[0]:
+                    # OpenAI format - convert to prompt
+                    processed_prompts = []
+                    for prompt_dict in prompts:
+                        if 'messages' in prompt_dict:
+                            messages = prompt_dict['messages']
+                            prompt = self.tokenizer.apply_chat_template(
+                                messages, tokenize=False, add_generation_prompt=True
+                            )
+                            processed_prompts.append(prompt)
+                        else:
+                            processed_prompts.append(prompt_dict)
+                else:
+                    processed_prompts = prompts
+                
+                # Handle stop tokens
+                stop_tokens = sampling_params.get('stop', [])
+                
+                # Generate using the model
+                outputs = []
+                for i, prompt in enumerate(processed_prompts):
+                    logger.info(f"Generating for prompt {i}, max_new_tokens: {sampling_params.get('max_new_tokens', 512)}")
+                    logger.info(f"no_stop_trim: {sampling_params.get('no_stop_trim', False)}")
+                    inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+                    
+                    with torch.no_grad():
+                        # Get all sampling parameters
+                        gen_kwargs = {
+                            **inputs,
+                            'max_new_tokens': sampling_params.get('max_new_tokens', 512),
+                            'temperature': sampling_params.get('temperature', 0.6),
+                            'top_p': sampling_params.get('top_p', 0.95),
+                            'repetition_penalty': sampling_params.get('repetition_penalty', 1.0),
+                            'do_sample': True,
+                            'pad_token_id': self.tokenizer.eos_token_id,
+                            'eos_token_id': self.tokenizer.eos_token_id,
+                            'early_stopping': False,
+                        }
+                        
+                        # Handle no_stop_trim parameter
+                        if sampling_params.get('no_stop_trim', False):
+                            # If no_stop_trim is True, we don't want to stop at any tokens
+                            # Remove eos_token_id to prevent early stopping
+                            gen_kwargs.pop('eos_token_id', None)
+                        
+                        generated_ids = self.model.generate(**gen_kwargs)
+                    
+                    # Decode the generated text
+                    generated_text = self.tokenizer.decode(generated_ids[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+                    logger.info(f"Generated text for prompt {i}: {repr(generated_text)}")
+                    
+                    # Apply stop token filtering manually if needed
+                    # Only apply stop token filtering if no_stop_trim is False
+                    if stop_tokens and not sampling_params.get('no_stop_trim', False):
+                        logger.info(f"Applying stop token filtering for prompt {i}")
+                        for stop_token in stop_tokens:
+                            if stop_token in generated_text:
+                                # Find the first occurrence of the stop token
+                                stop_index = generated_text.find(stop_token)
+                                if stop_index != -1:
+                                    logger.info(f"Found stop token '{stop_token}' at position {stop_index}")
+                                    generated_text = generated_text[:stop_index]
+                                    break
+                    else:
+                        logger.info(f"No stop token filtering applied for prompt {i} (no_stop_trim: {sampling_params.get('no_stop_trim', False)})")
+                    
+                    logger.info(f"Final generated text for prompt {i}: {repr(generated_text)}")
+                    outputs.append({"text": generated_text})
+                
+                return outputs
+            
+            def shutdown(self):
+                """No need to shutdown since we don't own the model."""
+                pass
+        
+        # Create generators that reuse the loaded model
+        reasoner_model = ReuseModelGeneratorMixin(
+            mode=cfg.model.reasoner_mode,
+            loaded_model=consistency_model,
+            loaded_tokenizer=tokenizer,
+            device=device,
+            server_url=cfg.model.reasoner_url,
+            server_params=OmegaConf.to_container(cfg.inference.server_params),
+        )
+        
+        summarizer_model = ReuseModelGeneratorMixin(
+            mode=cfg.model.summarizer_mode,
+            loaded_model=consistency_model,
+            loaded_tokenizer=tokenizer,
+            device=device,
+            server_url=cfg.model.summarizer_url,
+            server_params=OmegaConf.to_container(cfg.inference.server_params),
+        )
+        
+        logger.info("Created reasoner and summarizer models that reuse the loaded consistency model")
+    else:
+        # Fallback to original GeneratorMixin for OpenAI mode or when no consistency model
+        reasoner_model = GeneratorMixin(
+            mode=cfg.model.reasoner_mode,
+            server_url=cfg.model.reasoner_url,
+            model_name_or_path=cfg.model.reasoner_name_or_path,
+            server_params=OmegaConf.to_container(cfg.inference.server_params),
+        )
 
-    summarizer_tokenizer = None if use_openai_summarizer else AutoTokenizer.from_pretrained(cfg.model.summarizer_name_or_path)
-    summarizer_model = GeneratorMixin(
-        mode=cfg.model.summarizer_mode,
-        server_url=cfg.model.summarizer_url,
-        model_name_or_path=cfg.model.summarizer_name_or_path,
-        server_params=OmegaConf.to_container(cfg.inference.server_params),
-    )
+        summarizer_model = GeneratorMixin(
+            mode=cfg.model.summarizer_mode,
+            server_url=cfg.model.summarizer_url,
+            model_name_or_path=cfg.model.summarizer_name_or_path,
+            server_params=OmegaConf.to_container(cfg.inference.server_params),
+        )
 
     # Load templates and system messages
     reasoner_sys_message = load_sys_message(cfg.model.reasoner_name_or_path)
@@ -876,7 +1021,6 @@ def main(cfg: Any) -> None:
     )
     
     # Format initial prompts
-    tokenizer = reasoner_tokenizer if not use_openai_reasoner else None
     data = data.map(
         lambda x: format_initial_qa_prompt(
             x, reasoner_user_message_template, reasoner_sys_message, tokenizer, use_openai_reasoner
@@ -918,8 +1062,8 @@ def main(cfg: Any) -> None:
     # Initialize sampling parameters
     server_params = OmegaConf.to_container(cfg.inference.server_params)
     reasoner_sampling_params = OmegaConf.to_container(cfg.inference.reasoner_sampling_params)
-    if reasoner_tokenizer is not None:
-        reasoner_sampling_params["stop"] = [END_OF_SEARCH, END_OF_ANSWER, reasoner_tokenizer.eos_token]
+    if tokenizer is not None:
+        reasoner_sampling_params["stop"] = [END_OF_SEARCH, END_OF_ANSWER, tokenizer.eos_token]
     else:
         reasoner_sampling_params.pop("stop", None)
     summarizer_sampling_params = OmegaConf.to_container(cfg.inference.summarizer_sampling_params)
@@ -984,12 +1128,12 @@ def main(cfg: Any) -> None:
                 if not use_openai_reasoner and consistency_model is not None:
                     try:
                         # Find the position of the '>' token at the end of </search>
-                        closing_pos = find_closing_search_position(generated, reasoner_tokenizer)
+                        closing_pos = find_closing_search_position(generated, tokenizer)
                         
                         if closing_pos >= 0:
                             # Get the full text up to the closing position
                             full_text = seq["prompt"] + generated
-                            tokens = reasoner_tokenizer.encode(full_text)
+                            tokens = tokenizer.encode(full_text)
                             
                             if closing_pos < len(tokens):
                                 # Create input for consistency head
@@ -1092,7 +1236,7 @@ def main(cfg: Any) -> None:
             # Try simple summarization first
             summarizer_prompt = build_summarizer_prompt(
                 search_queries, search_results, summarizer_user_message_template, 
-                None, cfg, summarizer_tokenizer
+                None, cfg, tokenizer
             )
             # --- FIX: ensure summarizer_prompt_list is always correct for OpenAI/local modes ---
             use_openai_summarizer = cfg.model.summarizer_mode in ["openai", "proxy"]
@@ -1138,7 +1282,7 @@ def main(cfg: Any) -> None:
                 # Simple summarization worked
                 logger.info(f"Creating simple retrieval history entries for {len(search_queries)} queries")
                 retrieval_history_entries = create_simple_retrieval_history_entries(
-                    search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output, turn
+                    search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output, turn, consistency_scores
                 )
                 logger.info(f"Created {len(retrieval_history_entries)} retrieval history entries")
                 retrieval_history.extend(retrieval_history_entries)
@@ -1156,7 +1300,7 @@ def main(cfg: Any) -> None:
                 logger.info(f"Creating per-document retrieval history entries for {len(search_queries)} queries")
                 retrieval_history_entries = process_per_document_summarization(
                     search_queries, search_results, summarizer_user_message_template,
-                    summarizer_model, summarizer_sampling_params, summarizer_tokenizer, use_openai_summarizer, turn
+                    summarizer_model, summarizer_sampling_params, tokenizer, use_openai_summarizer, turn, consistency_scores
                 )
                 logger.info(f"Created {len(retrieval_history_entries)} per-document retrieval history entries")
                 retrieval_history.extend(retrieval_history_entries)
@@ -1250,8 +1394,8 @@ def main(cfg: Any) -> None:
     # Compute token statistics
     output_token_counts = []
     for seq in all_sequences:
-        if reasoner_tokenizer is not None:
-            tokens = reasoner_tokenizer.encode(seq["output"])
+        if tokenizer is not None:
+            tokens = tokenizer.encode(seq["output"])
             output_token_counts.append(len(tokens))
     
     if output_token_counts:
