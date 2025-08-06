@@ -284,10 +284,6 @@ def train_consistency_head(model: ModelWithConsistencyHead, tokenizer: AutoToken
                     # Add target position to inputs
                     inputs['target_positions'] = [target_position]
                     
-                    # Log target position for debugging (only first few examples)
-                    if i < 5:
-                        logger.info(f"Example {i}: Target position for '>' token: {target_position}")
-                    
                     # Forward pass
                     outputs = model(**inputs)
                     predicted_score = outputs['consistency_score']
