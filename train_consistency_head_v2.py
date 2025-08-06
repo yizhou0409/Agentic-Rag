@@ -135,9 +135,10 @@ def load_model(model_path: str, use_quantization: bool = False, use_multi_gpu: b
     # Configure device map for multi-GPU without quantization
     if use_multi_gpu and available_gpus >= 2:
         # Use device_map to distribute model across 2 GPUs
+        # H20 GPUs have 80GB memory each, so we can use most of it
         device_map = "auto"
-        max_memory = {0: "28GB", 1: "28GB", "cpu": "100GB"}
-        logger.info("Using device_map='auto' for 2 GPUs without quantization")
+        max_memory = {0: "75GB", 1: "75GB", "cpu": "100GB"}
+        logger.info("Using device_map='auto' for 2 H20 GPUs without quantization (75GB each)")
     else:
         device_map = "auto"
         max_memory = None
