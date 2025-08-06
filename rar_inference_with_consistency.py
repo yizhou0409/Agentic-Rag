@@ -400,7 +400,8 @@ def process_per_document_summarization(
     summarizer_model: GeneratorMixin,
     summarizer_sampling_params: Dict[str, Any],
     summarizer_tokenizer: Optional[AutoTokenizer],
-    use_openai_summarizer: bool
+    use_openai_summarizer: bool,
+    turn: int
 ) -> List[Dict[str, Any]]:
     """Process per-document summarization and aggregation."""
     retrieval_history_entries = []
@@ -513,7 +514,8 @@ def process_per_document_summarization(
                 else agg_prompt + "\n\n[OUTPUT STARTS HERE]\n\n" + final_analysis + "\n\n" + final_summary
             ),
             "summarization_method": "fallback",
-            "retrieval_method": "normal_retrieval"
+            "retrieval_method": "normal_retrieval",
+            "turn": turn
         })
     
     return retrieval_history_entries
@@ -523,7 +525,8 @@ def create_simple_retrieval_history_entries(
     search_results: List[List[Dict[str, Any]]],
     summary_outputs: List[Tuple[str, str]],
     summarizer_prompt_list: List[Union[str, List[Dict[str, str]]]],
-    summarizer_output: List[Dict[str, Any]]
+    summarizer_output: List[Dict[str, Any]],
+    turn: int
 ) -> List[Dict[str, Any]]:
     """Create retrieval history entries for simple summarization case."""
     retrieval_history_entries = []
@@ -560,7 +563,8 @@ def create_simple_retrieval_history_entries(
                 str(prompt) + "\n\n[OUTPUT STARTS HERE]\n\n" + summary_output[0] + "\n\n" + summary_output[1]
             ),
             "summarization_method": "simple",
-            "retrieval_method": "normal_retrieval"
+            "retrieval_method": "normal_retrieval",
+            "turn": turn
         })
     
     return retrieval_history_entries
@@ -874,6 +878,21 @@ def main(cfg: Any) -> None:
                                 logger.info(f"High consistency score ({consistency_score:.4f} > {consistency_threshold}), skipping retrieval for sequence {i}")
                                 sequences_to_skip_retrieval.append(i)
                                 consistency_scores.append(consistency_score) # Store for fallback
+                                
+                                # Create model knowledge fallback entry immediately
+                                fallback_entry = {
+                                    "query": search_q,
+                                    "retrieved_documents": [],  # No documents retrieved
+                                    "final_summary": "Used model's direct knowledge",
+                                    "final_summary_raw_output": generated,
+                                    "prompt_and_output": f"Model knowledge fallback - Consistency score: {consistency_score:.4f}\n\n{generated}",
+                                    "summarization_method": "model_knowledge_fallback",
+                                    "consistency_score": consistency_score,
+                                    "retrieval_method": "model_knowledge",
+                                    "turn": turn
+                                }
+                                retrieval_history.append(fallback_entry)
+                                
                                 # Continue generation to get answer
                                 continue
                 
@@ -956,7 +975,7 @@ def main(cfg: Any) -> None:
             if summary_outputs:
                 # Simple summarization worked
                 retrieval_history_entries = create_simple_retrieval_history_entries(
-                    search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output
+                    search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output, turn
                 )
                 retrieval_history.extend(retrieval_history_entries)
                 
