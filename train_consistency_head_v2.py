@@ -531,7 +531,7 @@ def detailed_validation(model: ModelWithConsistencyHead, tokenizer: AutoTokenize
                 result = {
                     'example_id': idx,
                     'question': question,
-                    'search_context': search_context,
+                    'search_query': example.get('search_query', 'N/A'),
                     'ground_truth': consistency_label.item(),
                     'predicted_score': predicted_score.item(),
                     'predicted_binary': pred_binary.item(),
@@ -621,7 +621,7 @@ def save_validation_report(validation_report: Dict[str, Any], save_path: str):
             f.write(f"   Loss: {wrong_case['loss']:.6f}\n")
             f.write(f"   Target Position: {wrong_case['target_position']}\n")
             f.write(f"   Question: {wrong_case['question'][:200]}{'...' if len(wrong_case['question']) > 200 else ''}\n")
-            f.write(f"   Search Context: {wrong_case['search_context'][:300]}{'...' if len(wrong_case['search_context']) > 300 else ''}\n")
+            f.write(f"   Search Query: {wrong_case['search_query'][:200]}{'...' if len(wrong_case['search_query']) > 200 else ''}\n")
             f.write("-" * 80 + "\n")
         
         # Correct classifications summary
