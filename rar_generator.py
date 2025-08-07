@@ -132,29 +132,23 @@ class GeneratorMixin:
             
             quantization_type = self.server_params.get('quantization')
             llm_int8_enable_fp32_cpu_offload = self.server_params.get('llm_int8_enable_fp32_cpu_offload', False)
-            use_multi_gpu = self.server_params.get('use_multi_gpu', True)  # Default to multi-GPU
-            num_gpus = self.server_params.get('num_gpus', torch.cuda.device_count())
+            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
             
             # Load tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            # Multi-GPU setup without quantization (default behavior)
-            if use_multi_gpu and not quantization_type:
+            # Multi-GPU setup without quantization (default when multiple GPUs available)
+            if not quantization_type and num_gpus > 1:
                 logger.info(f"Loading model on {num_gpus} GPUs without quantization...")
                 
-                # Set up device map for multi-GPU
-                if num_gpus > 1:
-                    # Use auto device map for multi-GPU
-                    device_map = "auto"
-                    max_memory = {}
-                    for i in range(num_gpus):
-                        max_memory[i] = f"{int(torch.cuda.get_device_properties(i).total_memory / 1024**3 * 0.9)}GB"
-                    max_memory["cpu"] = "100GB"  # Allow some CPU memory for offloading
-                else:
-                    device_map = {"": 0}
-                    max_memory = {0: "75GB"}
+                # Use auto device mapping for multi-GPU
+                device_map = "auto"
+                max_memory = {}
+                for i in range(num_gpus):
+                    max_memory[i] = f"{int(torch.cuda.get_device_properties(i).total_memory / 1024**3 * 0.9)}GB"
+                max_memory["cpu"] = "100GB"  # Allow some CPU memory for offloading
                 
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name_or_path,
@@ -167,7 +161,7 @@ class GeneratorMixin:
                 
                 logger.info(f"Model loaded successfully on {num_gpus} GPUs without quantization")
                 
-            # Single GPU with quantization
+            # Single GPU with quantization or fallback
             else:
                 if quantization_type == 'int8':
                     bnb_config = BitsAndBytesConfig(

@@ -381,6 +381,46 @@ def create_simple_retrieval_history_entries(
     
     return retrieval_history_entries
 
+def create_basic_retrieval_history_entries(
+    search_queries: List[str],
+    search_results: List[List[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    """Create basic retrieval history entries when summarization fails completely."""
+    retrieval_history_entries = []
+    
+    for query, results in zip(search_queries, search_results):
+        # Format documents for history
+        formatted_docs = []
+        for doc in results:
+            if 'title' in doc and 'text' in doc:
+                doc_title = doc['title']
+                doc_text = doc['text']
+            elif 'title' in doc and 'contents' in doc:
+                doc_title = doc['title']
+                doc_text = doc['contents']
+            elif 'text' in doc:
+                doc_title = ''
+                doc_text = doc['text']
+            elif 'contents' in doc:
+                doc_title = ''
+                doc_text = doc['contents']
+            else:
+                doc_title = ''
+                doc_text = str(doc)
+            formatted_docs.append(f"Document (Title: {doc_title}): {doc_text}")
+        
+        retrieval_history_entries.append({
+            "query": query,
+            "retrieved_documents": formatted_docs,
+            "final_summary": "Summarization failed - no summary available",
+            "final_summary_raw_output": "Summarization failed - no summary available",
+            "prompt_and_output": "Summarization failed - no prompt and output available",
+            "summarization_method": "failed",
+            "retrieval_method": "normal_retrieval"
+        })
+    
+    return retrieval_history_entries
+
 def save_outputs(
     data: List[Dict[str, Any]], 
     all_sequences: List[Dict[str, Any]], 
@@ -566,6 +606,8 @@ def main(cfg: Any) -> None:
     retriever = get_retriever(retriever_config)
 
     retrieval_history = []
+    # Track which questions have had retrievals to ensure we save history for all
+    question_retrieval_map = {}  # Maps question index to list of retrieval entries
     
     # Load corpus for index lookup
     corpus_path = cfg.retrieval.flashrag_config.corpus_path
@@ -603,13 +645,29 @@ def main(cfg: Any) -> None:
 
         # Process reasoner outputs
         search_queries = []
-        for seq, out in zip(active_sequences, reasoner_outputs):
+        query_to_question_map = []  # Maps each query to its corresponding question index
+        
+        for i, (seq, out) in enumerate(zip(active_sequences, reasoner_outputs)):
             generated = out["text"]
             seq["output"] += generated
             thought, search_q, answer = parse_reasoning_generation(generated)
             
+            # DEBUG: Log what was parsed from each sequence
+            logger.info(f"Turn {turn}, Sequence {i}: thought_length={len(thought)}, search_q={search_q is not None}, answer={answer is not None}")
+            if search_q:
+                logger.info(f"  Found search query: '{search_q}'")
+            
             if search_q:
                 search_queries.append(search_q)
+                # Find the original question index for this sequence
+                question_idx = None
+                for j, original_seq in enumerate(all_sequences):
+                    if original_seq is seq:
+                        question_idx = j
+                        break
+                query_to_question_map.append(question_idx)
+                logger.info(f"  Mapped search query to question index: {question_idx}")
+                
                 if use_openai_reasoner:
                     seq["messages"].append({"role": "assistant", "content": generated.rstrip()})
                 else:
@@ -617,29 +675,40 @@ def main(cfg: Any) -> None:
             elif answer:
                 seq["finished"] = True
                 seq["answer"] = answer
+                logger.info(f"  Sequence finished with answer: '{answer}'")
             else:
                 seq["finished"] = True
                 seq["answer"] = ""
+                logger.info(f"  Sequence finished without answer or search query")
         
         logger.info(f"Generated {len(search_queries)} search queries in turn {turn}")
+        logger.info(f"Search queries: {search_queries}")
         
         active_sequences = [seq for seq in active_sequences if not seq["finished"]]
 
         # Retrieval and summarization
         if search_queries:
+            logger.info(f"=== STARTING RETRIEVAL FOR TURN {turn} ===")
+            logger.info(f"About to send {len(search_queries)} queries to retriever")
+            
             start_search_time = time.time()
             search_results = retriever.batch_search(search_queries)
             ret_time = time.time() - start_search_time
             logger.info(f"Retrieval time: {ret_time:.2f} seconds")
             logger.info(f"Retrieved {len(search_results)} result sets for {len(search_queries)} queries")
-        else:
-            logger.info(f"No search queries generated in turn {turn}, skipping retrieval")
+            
+            # DEBUG: Log retrieval results
+            for i, (query, results) in enumerate(zip(search_queries, search_results)):
+                logger.info(f"  Query {i}: '{query}' -> {len(results)} documents retrieved")
+                if len(results) > 0:
+                    logger.info(f"    First doc title: {results[0].get('title', 'No title')}")
 
             # Try simple summarization first
             summarizer_prompt = build_summarizer_prompt(
                 search_queries, search_results, summarizer_user_message_template, 
                 None, cfg, summarizer_tokenizer
             )
+            
             # --- FIX: ensure summarizer_prompt_list is always correct for OpenAI/local modes ---
             use_openai_summarizer = cfg.model.summarizer_mode in ["openai", "proxy"]
             if use_openai_summarizer:
@@ -680,15 +749,22 @@ def main(cfg: Any) -> None:
             summarizer_output = summarizer_model.generate(summarizer_prompt_list, summarizer_sampling_params)
             summary_outputs = [parse_summary_generation(out["text"]) for out in summarizer_output]
             
-            if summary_outputs:
-                # Simple summarization worked
-                retrieval_history_entries = create_simple_retrieval_history_entries(
-                    search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output
-                )
-                logger.info(f"Created {len(retrieval_history_entries)} simple retrieval history entries")
-                retrieval_history.extend(retrieval_history_entries)
-                
-                for seq, entry in zip(active_sequences, retrieval_history_entries):
+            # Simple approach: Create retrieval history entries for ALL retrievals in this turn
+            turn_retrieval_entries = []
+            
+            # Process each query and create history entry
+            for i, (query, results, summary_output, prompt, raw_output) in enumerate(zip(
+                search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output
+            )):
+                # Create history entry for this retrieval
+                if summary_output and summary_output[1].strip() != "No useful information is extracted":
+                    # Simple summarization worked
+                    entry = create_simple_retrieval_history_entries(
+                        [query], [results], [summary_output], [prompt], [raw_output]
+                    )[0]
+                    
+                    # Apply summary to sequence
+                    seq = active_sequences[i]
                     summary = entry["final_summary"].strip()
                     append_summary = f"{BEGIN_OF_INFO} {summary} {END_OF_INFO}\n\n"
                     if use_openai_reasoner:
@@ -696,23 +772,60 @@ def main(cfg: Any) -> None:
                     else:
                         seq["prompt"] += append_summary
                     seq["output"] += append_summary
-            else:
-                # Fall back to per-document summarization
-                retrieval_history_entries = process_per_document_summarization(
-                    search_queries, search_results, summarizer_user_message_template,
-                    summarizer_model, summarizer_sampling_params, summarizer_tokenizer, use_openai_summarizer
-                )
-                logger.info(f"Created {len(retrieval_history_entries)} per-document retrieval history entries")
-                retrieval_history.extend(retrieval_history_entries)
+                else:
+                    # Simple summarization failed, try per-document
+                    try:
+                        entry = process_per_document_summarization(
+                            [query], [results], summarizer_user_message_template,
+                            summarizer_model, summarizer_sampling_params, summarizer_tokenizer, use_openai_summarizer
+                        )[0]
+                        
+                        # Apply summary to sequence
+                        seq = active_sequences[i]
+                        summary = entry["final_summary"].strip()
+                        append_summary = f"{BEGIN_OF_INFO} {summary} {END_OF_INFO}\n\n"
+                        if use_openai_reasoner:
+                            seq["messages"].append({"role": "user", "content": append_summary})
+                        else:
+                            seq["prompt"] += append_summary
+                        seq["output"] += append_summary
+                    except Exception as e:
+                        # Per-document also failed, create basic entry
+                        logger.warning(f"Both summarization methods failed for query {i}: {e}")
+                        entry = create_basic_retrieval_history_entries([query], [results])[0]
+                        
+                        # Don't append summary to sequence since summarization failed
+                        seq = active_sequences[i]
+                        if use_openai_reasoner:
+                            seq["messages"].append({"role": "user", "content": "Summarization failed - no additional information available."})
+                        else:
+                            seq["prompt"] += "Summarization failed - no additional information available."
+                        seq["output"] += "Summarization failed - no additional information available."
                 
-                for seq, entry in zip(active_sequences, retrieval_history_entries):
-                    summary = entry["final_summary"].strip()
-                    append_summary = f"{BEGIN_OF_INFO} {summary} {END_OF_INFO}\n\n"
-                    if use_openai_reasoner:
-                        seq["messages"].append({"role": "user", "content": append_summary})
-                    else:
-                        seq["prompt"] += append_summary
-                    seq["output"] += append_summary
+                # Add entry to this turn's list
+                turn_retrieval_entries.append(entry)
+            
+            logger.info(f"Created {len(turn_retrieval_entries)} retrieval history entries for turn {turn}")
+            
+            # Add all entries from this turn to the main retrieval history
+            retrieval_history.extend(turn_retrieval_entries)
+            
+            # Track which questions had retrievals in this turn
+            logger.info(f"=== RECORDING RETRIEVAL HISTORY FOR TURN {turn} ===")
+            logger.info(f"Current retrieval history size: {len(retrieval_history)}")
+            
+            for i, (question_idx, entry) in enumerate(zip(query_to_question_map, turn_retrieval_entries)):
+                if question_idx is not None:
+                    if question_idx not in question_retrieval_map:
+                        question_retrieval_map[question_idx] = []
+                    question_retrieval_map[question_idx].append(entry)
+                    logger.info(f"  Recorded retrieval for question {question_idx}: entry {i}")
+                else:
+                    logger.warning(f"  Could not map query {i} to a question index!")
+            
+            logger.info(f"=== FINISHED RETRIEVAL FOR TURN {turn} ===")
+        else:
+            logger.info(f"No search queries generated in turn {turn}, skipping retrieval")
 
     # Force finish remaining sequences
     logger.info("-------- Turn limit reached. Forcing active sequences to finish. --------")
@@ -752,6 +865,14 @@ def main(cfg: Any) -> None:
     if summarizer_model is not None:
         summarizer_model.shutdown()
 
+    # Ensure all retrievals are properly recorded in retrieval history
+    logger.info(f"Final retrieval history has {len(retrieval_history)} entries")
+    logger.info(f"Question retrieval map has {len(question_retrieval_map)} questions with retrievals")
+    
+    # Log which questions had retrievals for debugging
+    for question_idx, retrievals in question_retrieval_map.items():
+        logger.info(f"Question {question_idx} had {len(retrievals)} retrievals")
+    
     # Evaluate results
     metrics_list, metrics_agg = run_evaluation(data, all_sequences)
     logger.info(f"Metrics: {metrics_agg}")
