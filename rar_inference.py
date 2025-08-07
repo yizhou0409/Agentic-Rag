@@ -412,6 +412,7 @@ def save_outputs(
         json.dump(outputs, f, indent=2)
     
     # Save retrieval history
+    logger.info(f"Saving {len(retrieval_history)} retrieval history entries")
     retrieval_history_file_name = f'retrieval_history_{timestamp}.json'
     with open(f"{output_dir}/{retrieval_history_file_name}", "w") as f:
         json.dump(retrieval_history, f, indent=2)
@@ -620,6 +621,8 @@ def main(cfg: Any) -> None:
                 seq["finished"] = True
                 seq["answer"] = ""
         
+        logger.info(f"Generated {len(search_queries)} search queries in turn {turn}")
+        
         active_sequences = [seq for seq in active_sequences if not seq["finished"]]
 
         # Retrieval and summarization
@@ -628,6 +631,9 @@ def main(cfg: Any) -> None:
             search_results = retriever.batch_search(search_queries)
             ret_time = time.time() - start_search_time
             logger.info(f"Retrieval time: {ret_time:.2f} seconds")
+            logger.info(f"Retrieved {len(search_results)} result sets for {len(search_queries)} queries")
+        else:
+            logger.info(f"No search queries generated in turn {turn}, skipping retrieval")
 
             # Try simple summarization first
             summarizer_prompt = build_summarizer_prompt(
@@ -679,6 +685,7 @@ def main(cfg: Any) -> None:
                 retrieval_history_entries = create_simple_retrieval_history_entries(
                     search_queries, search_results, summary_outputs, summarizer_prompt_list, summarizer_output
                 )
+                logger.info(f"Created {len(retrieval_history_entries)} simple retrieval history entries")
                 retrieval_history.extend(retrieval_history_entries)
                 
                 for seq, entry in zip(active_sequences, retrieval_history_entries):
@@ -695,6 +702,7 @@ def main(cfg: Any) -> None:
                     search_queries, search_results, summarizer_user_message_template,
                     summarizer_model, summarizer_sampling_params, summarizer_tokenizer, use_openai_summarizer
                 )
+                logger.info(f"Created {len(retrieval_history_entries)} per-document retrieval history entries")
                 retrieval_history.extend(retrieval_history_entries)
                 
                 for seq, entry in zip(active_sequences, retrieval_history_entries):

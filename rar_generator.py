@@ -125,56 +125,88 @@ class GeneratorMixin:
             self._init_transformers_pipeline()
 
     def _init_transformers_pipeline(self) -> None:
-        """Initialize transformers pipeline with BitsAndBytes quantization."""
+        """Initialize transformers pipeline with BitsAndBytes quantization or multi-GPU support."""
         try:
             from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
             import torch
             
             quantization_type = self.server_params.get('quantization')
             llm_int8_enable_fp32_cpu_offload = self.server_params.get('llm_int8_enable_fp32_cpu_offload', False)
+            use_multi_gpu = self.server_params.get('use_multi_gpu', True)  # Default to multi-GPU
+            num_gpus = self.server_params.get('num_gpus', torch.cuda.device_count())
             
-            if quantization_type == 'int8':
-                bnb_config = BitsAndBytesConfig(
-                    load_in_8bit=True,
-                    llm_int8_threshold=6.0,
-                    llm_int8_has_fp16_weight=False,
-                    llm_int8_enable_fp32_cpu_offload=llm_int8_enable_fp32_cpu_offload,
-                )
-                logger.info(f"Loading model with int8 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
-            elif quantization_type == 'int4':
-                bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                    llm_int8_enable_fp32_cpu_offload=llm_int8_enable_fp32_cpu_offload
-                )
-                logger.info(f"Loading model with int4 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
-            else:
-                bnb_config = None
-                logger.info("Loading model without quantization...")
-
-            # Load tokenizer and model
+            # Load tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            # Determine device map based on quantization
-            device_map = {"": 0}  # Force everything on GPU 0
-            max_memory = {0: "75GB"} if quantization_type == 'int8' else {0: "75GB"}
-            
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name_or_path,
-                quantization_config=bnb_config,
-                device_map=device_map,
-                max_memory=max_memory,
-                torch_dtype=torch.float16 if bnb_config is None else None,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True
-            )
+            # Multi-GPU setup without quantization (default behavior)
+            if use_multi_gpu and not quantization_type:
+                logger.info(f"Loading model on {num_gpus} GPUs without quantization...")
+                
+                # Set up device map for multi-GPU
+                if num_gpus > 1:
+                    # Use auto device map for multi-GPU
+                    device_map = "auto"
+                    max_memory = {}
+                    for i in range(num_gpus):
+                        max_memory[i] = f"{int(torch.cuda.get_device_properties(i).total_memory / 1024**3 * 0.9)}GB"
+                    max_memory["cpu"] = "100GB"  # Allow some CPU memory for offloading
+                else:
+                    device_map = {"": 0}
+                    max_memory = {0: "75GB"}
+                
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name_or_path,
+                    device_map=device_map,
+                    max_memory=max_memory,
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True
+                )
+                
+                logger.info(f"Model loaded successfully on {num_gpus} GPUs without quantization")
+                
+            # Single GPU with quantization
+            else:
+                if quantization_type == 'int8':
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_8bit=True,
+                        llm_int8_threshold=6.0,
+                        llm_int8_has_fp16_weight=False,
+                        llm_int8_enable_fp32_cpu_offload=llm_int8_enable_fp32_cpu_offload,
+                    )
+                    logger.info(f"Loading model with int8 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
+                elif quantization_type == 'int4':
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                        llm_int8_enable_fp32_cpu_offload=llm_int8_enable_fp32_cpu_offload
+                    )
+                    logger.info(f"Loading model with int4 quantization and CPU offload {'enabled' if llm_int8_enable_fp32_cpu_offload else 'disabled'}...")
+                else:
+                    bnb_config = None
+                    logger.info("Loading model without quantization on single GPU...")
+
+                # Determine device map based on quantization
+                device_map = {"": 0}  # Force everything on GPU 0
+                max_memory = {0: "75GB"} if quantization_type == 'int8' else {0: "75GB"}
+                
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name_or_path,
+                    quantization_config=bnb_config,
+                    device_map=device_map,
+                    max_memory=max_memory,
+                    torch_dtype=torch.float16 if bnb_config is None else None,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True
+                )
+                
+                logger.info(f"Model loaded successfully with transformers. Memory usage reduced with quantization: {quantization_type}")
             
             self.use_transformers = True
-            logger.info(f"Model loaded successfully with transformers. Memory usage reduced with quantization: {quantization_type}")
             
         except ImportError as e:
             logger.error(f"BitsAndBytes not available: {e}")
@@ -224,16 +256,24 @@ class GeneratorMixin:
         prompts: List[str], 
         sampling_params: Dict[str, Any]
     ) -> List[Dict[str, str]]:
-        """Generate responses using transformers with quantization."""
+        """Generate responses using transformers with quantization or multi-GPU."""
         import torch
         from tqdm import tqdm
         
-        outputs = []
-        batch_size = 1  # Process one at a time to minimize memory usage
-        logger.info(f"Processing {len(prompts)} prompts with transformers + quantization (batch_size={batch_size})...")
+        use_multi_gpu = self.server_params.get('use_multi_gpu', True)  # Default to multi-GPU
+        
+        # Determine batch size based on setup
+        if use_multi_gpu:
+            batch_size = min(4, len(prompts))  # Larger batch size for multi-GPU
+            logger.info(f"Processing {len(prompts)} prompts with transformers on multiple GPUs (batch_size={batch_size})...")
+        else:
+            batch_size = 1  # Process one at a time to minimize memory usage for single GPU
+            logger.info(f"Processing {len(prompts)} prompts with transformers + quantization (batch_size={batch_size})...")
         
         # Clear cache before starting
         torch.cuda.empty_cache()
+        
+        outputs = []
         
         # Process in batches
         for batch_start in tqdm(range(0, len(prompts), batch_size), desc="Processing batches", ncols=100):
@@ -248,7 +288,13 @@ class GeneratorMixin:
                 truncation=True,
                 max_length=1024
             )
-            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            
+            # Move inputs to the appropriate device(s)
+            if use_multi_gpu:
+                # For multi-GPU, inputs will be automatically distributed
+                inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            else:
+                inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
             
             # Generate for batch
             with torch.no_grad():
