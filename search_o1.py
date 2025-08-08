@@ -27,7 +27,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 from tqdm import tqdm
 import logging
 
@@ -43,6 +43,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class StopOnStringCriteria(StoppingCriteria):
+    """Stopping criteria that stops generation when a specific string is found."""
+    
+    def __init__(self, tokenizer, stop_strings):
+        self.tokenizer = tokenizer
+        self.stop_strings = stop_strings if isinstance(stop_strings, list) else [stop_strings]
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        decoded_output = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        return any(stop_string in decoded_output for stop_string in self.stop_strings)
+
+
 @dataclass
 class SearchO1Config:
     """Configuration for Search-o1 system."""
@@ -54,7 +66,7 @@ class SearchO1Config:
     
     # Generation settings
     max_turns: int = 5
-    max_new_tokens: int = 32768
+    max_new_tokens: int = 2048
     temperature: float = 0.6
     top_p: float = 0.95
     top_k: int = 20
@@ -135,16 +147,12 @@ class Reasoner:
         # Tokenize input
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
         
-        # Define stop words for <search> and <answer> tags
-        stop_words = ["</search>", "</answer>"]
-        stop_word_ids = []
+        # Create stopping criteria for </search> and </answer> tags
+        stopping_criteria = StoppingCriteriaList([
+            StopOnStringCriteria(self.tokenizer, ["</search>", "</answer>"])
+        ])
         
-        for stop_word in stop_words:
-            stop_word_tokens = self.tokenizer.encode(stop_word, add_special_tokens=False)
-            if len(stop_word_tokens) > 0:
-                stop_word_ids.append(stop_word_tokens)
-        
-        # Generate response with stop words
+        # Generate response with proper stopping criteria
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **model_inputs,
@@ -156,8 +164,7 @@ class Reasoner:
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
-                # Use stop words to halt generation at </search> or </answer>
-                stopping_criteria=self._get_stopping_criteria(stop_word_ids)
+                stopping_criteria=stopping_criteria
             )
         
         # Decode response
@@ -167,25 +174,6 @@ class Reasoner:
         response = generated_text[len(text):]
         
         return response
-    
-    def _get_stopping_criteria(self, stop_word_ids):
-        """Create stopping criteria for stop words."""
-        from transformers import StoppingCriteria, StoppingCriteriaList
-        
-        class StopWordCriteria(StoppingCriteria):
-            def __init__(self, stop_word_ids):
-                self.stop_word_ids = stop_word_ids
-            
-            def __call__(self, input_ids, scores, **kwargs):
-                # Check if any stop word appears in the generated sequence
-                for stop_word_id in self.stop_word_ids:
-                    if len(input_ids[0]) >= len(stop_word_id):
-                        # Check if the last tokens match the stop word
-                        if input_ids[0][-len(stop_word_id):].tolist() == stop_word_id:
-                            return True
-                return False
-        
-        return StoppingCriteriaList([StopWordCriteria(stop_word_ids)])
 
 
 class Summarizer:
@@ -248,18 +236,7 @@ class Summarizer:
         # Tokenize input
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
         
-        # Define stop words for summarization (end of summary)
-        # The prompt expects output to start with "### Extracted Information"
-        # We want to stop after the extracted information is complete
-        stop_words = ["\n\n", "\n###", "###", "### Extracted Information"]
-        stop_word_ids = []
-        
-        for stop_word in stop_words:
-            stop_word_tokens = self.tokenizer.encode(stop_word, add_special_tokens=False)
-            if len(stop_word_tokens) > 0:
-                stop_word_ids.append(stop_word_tokens)
-        
-        # Generate summary with stop words
+        # Generate summary
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **model_inputs,
@@ -268,9 +245,7 @@ class Summarizer:
                 top_p=0.9,
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                # Use stop words to halt generation at natural boundaries
-                stopping_criteria=self._get_stopping_criteria(stop_word_ids)
+                eos_token_id=self.tokenizer.eos_token_id
             )
         
         # Decode response
@@ -297,24 +272,7 @@ class Summarizer:
         # If the expected format is not found, return the full summary
         return summary.strip()
     
-    def _get_stopping_criteria(self, stop_word_ids):
-        """Create stopping criteria for stop words."""
-        from transformers import StoppingCriteria, StoppingCriteriaList
-        
-        class StopWordCriteria(StoppingCriteria):
-            def __init__(self, stop_word_ids):
-                self.stop_word_ids = stop_word_ids
-            
-            def __call__(self, input_ids, scores, **kwargs):
-                # Check if any stop word appears in the generated sequence
-                for stop_word_id in self.stop_word_ids:
-                    if len(input_ids[0]) >= len(stop_word_id):
-                        # Check if the last tokens match the stop word
-                        if input_ids[0][-len(stop_word_id):].tolist() == stop_word_id:
-                            return True
-                return False
-        
-        return StoppingCriteriaList([StopWordCriteria(stop_word_ids)])
+
 
 
 class SearchO1System:
@@ -441,6 +399,10 @@ class SearchO1System:
                 search_query = self._extract_search_query(response)
                 answer = self._extract_answer(response)
                 
+                logger.info(f"Question {question_data['id']} response: {response[:100]}...")
+                logger.info(f"Extracted search_query: {search_query}")
+                logger.info(f"Extracted answer: {answer}")
+                
                 # Record turn info
                 turn_info = {
                     "turn": turn_num + 1,
@@ -475,6 +437,7 @@ class SearchO1System:
             # Step 3: Process all search queries together (if any)
             if search_queries:
                 logger.info(f"Processing {len(search_queries)} search queries in turn {turn_num + 1}")
+                logger.info(f"Search queries: {list(search_queries.values())}")
                 
                 # Collect all unique search queries to avoid duplicate retrievals
                 unique_queries = list(set(search_queries.values()))
@@ -487,31 +450,41 @@ class SearchO1System:
                 
                 # Process each unique query
                 for query in unique_queries:
-                    # Retrieve documents
-                    retrieved_docs = self.retriever.search(query, num=self.config.top_k_docs)
-                    doc_texts = []
-                    for doc in retrieved_docs:
-                        if isinstance(doc, dict):
-                            doc_text = doc.get('text', doc.get('contents', str(doc)))
-                        else:
-                            doc_text = str(doc)
-                        doc_texts.append(doc_text)
-                    
-                    # Summarize documents
-                    summary = self.summarizer.summarize_documents(query, doc_texts)
-                    
-                    # Update information for all questions that used this query
-                    for question_id in query_to_questions[query]:
-                        for question_data in active_questions:
-                            if question_data["id"] == question_id:
-                                question_data["current_information"] = summary
-                                # Update turn info with retrieval results
-                                for turn_info in question_data["turns"]:
-                                    if turn_info["search_query"] == query:
-                                        turn_info["retrieved_docs"] = [str(doc) for doc in retrieved_docs]
-                                        turn_info["summary"] = summary
-                                        break
-                                break
+                    logger.info(f"Retrieving documents for query: {query}")
+                    try:
+                        # Retrieve documents
+                        retrieved_docs = self.retriever.search(query, num=self.config.top_k_docs)
+                        logger.info(f"Retrieved {len(retrieved_docs)} documents")
+                        
+                        doc_texts = []
+                        for doc in retrieved_docs:
+                            if isinstance(doc, dict):
+                                doc_text = doc.get('text', doc.get('contents', str(doc)))
+                            else:
+                                doc_text = str(doc)
+                            doc_texts.append(doc_text)
+                        
+                        # Summarize documents
+                        logger.info(f"Summarizing {len(doc_texts)} documents")
+                        summary = self.summarizer.summarize_documents(query, doc_texts)
+                        logger.info(f"Summary length: {len(summary)} characters")
+                        
+                        # Update information for all questions that used this query
+                        for question_id in query_to_questions[query]:
+                            for question_data in active_questions:
+                                if question_data["id"] == question_id:
+                                    question_data["current_information"] = summary
+                                    logger.info(f"Updated information for question {question_id}")
+                                    # Update turn info with retrieval results
+                                    for turn_info in question_data["turns"]:
+                                        if turn_info["search_query"] == query:
+                                            turn_info["retrieved_docs"] = [str(doc) for doc in retrieved_docs]
+                                            turn_info["summary"] = summary
+                                            break
+                                    break
+                    except Exception as e:
+                        logger.error(f"Error processing query '{query}': {e}")
+                        # Continue with other queries
             
             # Step 4: Check if max turns reached for remaining questions
             if turn_num == self.config.max_turns - 1 and active_questions:
@@ -596,7 +569,7 @@ def main():
     
     # Generation settings
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum number of turns")
-    parser.add_argument("--max-new-tokens", type=int, default=32768, help="Maximum new tokens to generate")
+    parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum new tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.6, help="Generation temperature")
     parser.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling")
     parser.add_argument("--top-k", type=int, default=20, help="Top-k sampling")
