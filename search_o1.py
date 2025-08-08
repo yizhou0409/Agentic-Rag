@@ -519,6 +519,7 @@ class SearchO1System:
                 del result["current_information"]
         
         # Save intermediate results
+        
         if self.config.save_intermediate:
             self._save_intermediate_results(all_results)
         
