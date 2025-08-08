@@ -44,15 +44,23 @@ logger = logging.getLogger(__name__)
 
 
 class StopOnStringCriteria(StoppingCriteria):
-    """Stopping criteria that stops generation when a specific string is found."""
+    """Stopping criteria that stops generation when a specific string is found in newly generated tokens."""
     
-    def __init__(self, tokenizer, stop_strings):
+    def __init__(self, tokenizer, stop_strings, initial_length):
         self.tokenizer = tokenizer
         self.stop_strings = stop_strings if isinstance(stop_strings, list) else [stop_strings]
+        self.initial_length = initial_length
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        decoded_output = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        return any(stop_string in decoded_output for stop_string in self.stop_strings)
+        # Only check the newly generated tokens (after the initial input)
+        if input_ids.shape[1] <= self.initial_length:
+            return False
+        
+        # Decode only the newly generated part
+        new_tokens = input_ids[0][self.initial_length:]
+        decoded_new_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        
+        return any(stop_string in decoded_new_text for stop_string in self.stop_strings)
 
 
 @dataclass
@@ -146,10 +154,11 @@ class Reasoner:
         
         # Tokenize input
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        initial_length = model_inputs['input_ids'].shape[1]
         
         # Create stopping criteria for </search> and </answer> tags
         stopping_criteria = StoppingCriteriaList([
-            StopOnStringCriteria(self.tokenizer, ["</search>", "</answer>"])
+            StopOnStringCriteria(self.tokenizer, ["</search>", "</answer>"], initial_length)
         ])
         
         # Generate response with proper stopping criteria
