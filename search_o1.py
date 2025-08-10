@@ -124,36 +124,21 @@ class Reasoner:
         
         self.prompt_template = prompt_data['user_prompt']
     
-    def generate_response(self, question: str, information: Optional[str] = None) -> str:
+    def generate_response(self, sequence: str) -> str:
         """
         Generate a response from the reasoner with stop words for <search> and <answer> tags.
         
         Args:
             question: The question to answer
-            information: Optional retrieved information from previous searches
+            sequence: Optional sequence containing previous responses and information.
+                     If None, initializes a new sequence with the question under prompt template.
             
         Returns:
             Generated response text
         """
-        # Prepare the prompt
-        if information:
-            # Add information to the prompt if available
-            prompt = self.prompt_template.format(question=question)
-            prompt += f"\n\n<information>\n{information}\n</information>\n\n"
-        else:
-            prompt = self.prompt_template.format(question=question)
-        
-        # Prepare messages for chat template
-        messages = [{"role": "user", "content": prompt}]
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True
-        )
         
         # Tokenize input
-        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        model_inputs = self.tokenizer([sequence], return_tensors="pt").to(self.model.device)
         initial_length = model_inputs['input_ids'].shape[1]
         
         # Create stopping criteria for </search> and </answer> tags
@@ -180,7 +165,7 @@ class Reasoner:
         generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         
         # Extract only the generated part (after the input)
-        response = generated_text[len(text):]
+        response = generated_text[len(sequence):]
         
         return response
 
@@ -337,8 +322,8 @@ class SearchO1System:
     
     def process_dataset(self, dataset_path: str) -> List[Dict[str, Any]]:
         """
-        Process an entire dataset using batch processing for efficiency.
-        All questions are processed together in each turn.
+        Process an entire dataset using sequence-based processing.
+        Each question maintains its own sequence of responses and information.
         
         Args:
             dataset_path: Path to the dataset file
@@ -366,20 +351,36 @@ class SearchO1System:
                         "golden_answers": data["metadata"]["answer"]
                     })
         
+        logger.info(f"Loaded {len(questions)} questions from dataset")
+        
         # Limit samples if specified
         if self.config.max_samples:
+            original_count = len(questions)
             questions = questions[:self.config.max_samples]
+            logger.info(f"Limited to {len(questions)} questions (max_samples: {self.config.max_samples}, original: {original_count})")
         
-        logger.info(f"Processing {len(questions)} questions in batch mode")
+        logger.info(f"Processing {len(questions)} questions with sequence-based approach")
         
-        # Initialize all questions for batch processing
+        # Initialize all questions with their sequences
         active_questions = []
         for question_data in questions:
+            # Initialize sequence with the question under prompt template
+            prompted_question = self.reasoner.prompt_template.format(question=question_data["question"])
+            
+            # Prepare messages for chat template
+            messages = [{"role": "user", "content": prompted_question}]
+            initial_sequence = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True
+            )
             active_questions.append({
                 "id": question_data["id"],
                 "question": question_data["question"],
                 "golden_answers": question_data["golden_answers"],
-                "current_information": "",
+                "sequence": initial_sequence,  # Initialize sequence with question
+                "full_response": "",  # Track the full response for each question
                 "turns": [],
                 "final_turn": 0,
                 "answer": None,
@@ -398,10 +399,10 @@ class SearchO1System:
             completed_questions = []
             
             for question_data in active_questions:
-                # Generate response from reasoner
+                # Generate response using the current sequence
+                logger.info(f"Generating response for question {question_data['id']} with sequence length: {len(question_data['sequence'])}")
                 response = self.reasoner.generate_response(
-                    question_data["question"], 
-                    question_data["current_information"]
+                    question_data["sequence"]
                 )
                 
                 # Extract search query or answer
@@ -420,6 +421,17 @@ class SearchO1System:
                     "answer": answer
                 }
                 question_data["turns"].append(turn_info)
+                
+                # Update sequence with the current response
+                question_data["sequence"] += f"{response}"
+                
+                # Update full response
+                if question_data["full_response"]:
+                    question_data["full_response"] += f"\n\n{response}"
+                else:
+                    question_data["full_response"] = response
+                
+                logger.info(f"Updated sequence for question {question_data['id']} with response (new length: {len(question_data['sequence'])})")
                 
                 if answer:
                     # Question answered, mark as completed
@@ -478,13 +490,18 @@ class SearchO1System:
                         summary = self.summarizer.summarize_documents(query, doc_texts)
                         logger.info(f"Summary length: {len(summary)} characters")
                         
-                        # Update information for all questions that used this query
+                        # Update sequence for all questions that used this query
                         for question_id in query_to_questions[query]:
                             for question_data in active_questions:
                                 if question_data["id"] == question_id:
-                                    question_data["current_information"] = summary
-                                    logger.info(f"Updated information for question {question_id}")
-                                    # Update turn info with retrieval results
+                                    # Append information to the sequence with proper formatting
+                                    information_block = f"<information> {summary} </information>"
+                                    question_data["sequence"] += information_block
+                                    
+                                    logger.info(f"Updated sequence for question {question_id} with information block (length: {len(question_data['sequence'])})")
+                                    logger.info(f"Information block added: {information_block[:100]}...")
+                                    
+                                    # Update turn info with retrieval results (but don't include in final results)
                                     for turn_info in question_data["turns"]:
                                         if turn_info["search_query"] == query:
                                             turn_info["retrieved_docs"] = [str(doc) for doc in retrieved_docs]
@@ -514,15 +531,19 @@ class SearchO1System:
             else:
                 result["metrics"] = {"em": 0.0, "f1": 0.0}
             
-            # Clean up temporary fields
-            if "current_information" in result:
-                del result["current_information"]
+            # Clean up temporary fields that shouldn't be in final results
+            if "sequence" in result:
+                del result["sequence"]
+            
+            # Ensure full_response is included in final results
+            if "full_response" not in result:
+                result["full_response"] = ""
         
         # Save intermediate results
-        
         if self.config.save_intermediate:
             self._save_intermediate_results(all_results)
         
+        logger.info(f"Processed {len(all_results)} questions successfully")
         return all_results
     
     def _save_intermediate_results(self, results: List[Dict[str, Any]]):
@@ -533,19 +554,52 @@ class SearchO1System:
     
     def save_final_results(self, results: List[Dict[str, Any]], dataset_name: str):
         """Save final results and evaluation metrics."""
-        # Save detailed results
+        # Prepare results without retrieved documents for main results file
+        clean_results = []
+        retrieval_results = []
+        
+        for result in results:
+            # Create clean result without retrieved documents
+            clean_result = result.copy()
+            
+            # Remove retrieved_docs from turns for main results
+            for turn in clean_result["turns"]:
+                if "retrieved_docs" in turn:
+                    # Store retrieval info separately
+                    retrieval_results.append({
+                        "question_id": result["id"],
+                        "turn": turn["turn"],
+                        "search_query": turn["search_query"],
+                        "retrieved_docs": turn["retrieved_docs"],
+                        "summary": turn.get("summary", "")
+                    })
+                    # Remove from main results
+                    del turn["retrieved_docs"]
+                    if "summary" in turn:
+                        del turn["summary"]
+            
+            clean_results.append(clean_result)
+        
+        # Save detailed results (without retrieved documents)
         output_file = os.path.join(self.config.output_dir, f"{dataset_name}_results.json")
         with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(clean_results, f, indent=2)
+        
+        # Save retrieval results separately
+        if retrieval_results:
+            retrieval_file = os.path.join(self.config.output_dir, f"{dataset_name}_retrieval_results.json")
+            with open(retrieval_file, 'w') as f:
+                json.dump(retrieval_results, f, indent=2)
+            logger.info(f"Retrieval results saved to {retrieval_file}")
         
         # Calculate and save summary metrics
-        total_questions = len(results)
-        answered_questions = sum(1 for r in results if r["answer"] is not None)
+        total_questions = len(clean_results)
+        answered_questions = sum(1 for r in clean_results if r["answer"] is not None)
         
-        avg_em = sum(r["metrics"]["em"] for r in results) / total_questions
-        avg_f1 = sum(r["metrics"]["f1"] for r in results) / total_questions
+        avg_em = sum(r["metrics"]["em"] for r in clean_results) / total_questions
+        avg_f1 = sum(r["metrics"]["f1"] for r in clean_results) / total_questions
         
-        avg_turns = sum(r["final_turn"] for r in results) / total_questions
+        avg_turns = sum(r["final_turn"] for r in clean_results) / total_questions
         
         summary = {
             "dataset": dataset_name,
