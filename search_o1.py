@@ -23,13 +23,16 @@ import json
 import argparse
 import re
 import yaml
+import pickle
+import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList, AutoModel
 from tqdm import tqdm
 import logging
+import faiss
 
 # Import FlashRAG retriever
 from flashrag.utils import get_retriever
@@ -63,6 +66,97 @@ class StopOnStringCriteria(StoppingCriteria):
         return any(stop_string in decoded_new_text for stop_string in self.stop_strings)
 
 
+class E5Retriever:
+    """E5-based retriever for semantic search."""
+    
+    def __init__(self, index_path: str, model_name: str = "intfloat/e5-large-v2", device: str = None):
+        self.index_path = Path(index_path)
+        self.model_name = model_name
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Load E5 model
+        logger.info(f"Loading E5 model: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Load index and metadata
+        logger.info(f"Loading E5 index from: {index_path}")
+        self.index, self.chunks = self._load_index()
+        
+        logger.info(f"E5 retriever initialized with {len(self.chunks)} chunks")
+    
+    def _load_index(self) -> tuple:
+        """Load the saved index and metadata."""
+        index_path = self.index_path / "index" / "wikipedia_index.faiss"
+        metadata_path = self.index_path / "metadata" / "chunks.pkl"
+        
+        if not index_path.exists() or not metadata_path.exists():
+            raise FileNotFoundError(f"Index or metadata files not found: {index_path}, {metadata_path}")
+        
+        # Load index
+        index = faiss.read_index(str(index_path))
+        
+        # Load metadata
+        with open(metadata_path, 'rb') as f:
+            chunks = pickle.load(f)
+            
+        return index, chunks
+    
+    def _generate_embedding(self, text: str) -> np.ndarray:
+        """Generate embedding for a single text using E5 model."""
+        # Add prefix for E5
+        if not text.startswith("query: "):
+            text = f"query: {text}"
+        
+        # Tokenize
+        inputs = self.tokenizer(
+            text,
+            max_length=512,
+            padding=True,
+            truncation=True,
+            return_tensors="pt"
+        ).to(self.device)
+        
+        # Generate embedding
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            # Mean pooling
+            attention_mask = inputs['attention_mask']
+            token_embeddings = outputs.last_hidden_state
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            embedding = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            embedding = embedding.cpu().numpy()
+            
+            # Normalize
+            faiss.normalize_L2(embedding)
+            
+        return embedding
+    
+    def search(self, query: str, num: int = 10) -> List[Dict[str, Any]]:
+        """Search for documents similar to the query."""
+        # Generate query embedding
+        query_embedding = self._generate_embedding(query)
+        
+        # Search
+        scores, indices = self.index.search(query_embedding.astype('float32'), num)
+        
+        # Get results
+        results = []
+        for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+            if idx < len(self.chunks):
+                result = self.chunks[idx].copy()
+                result['score'] = float(score)
+                result['rank'] = i + 1
+                # Ensure the result has a 'text' field for compatibility
+                if 'text' not in result:
+                    result['text'] = result.get('content', str(result))
+                results.append(result)
+        
+        return results
+
+
 @dataclass
 class SearchO1Config:
     """Configuration for Search-o1 system."""
@@ -71,6 +165,7 @@ class SearchO1Config:
     summarizer_model_name: str = "Qwen/Qwen3-32B"
     retriever_type: str = "bm25"  # or "e5"
     retriever_index_path: str = "indexes/bm25"
+    e5_model_path: str = "intfloat/e5-large-v2"  # Path to E5 model
     
     # Generation settings
     max_turns: int = 5
@@ -303,6 +398,8 @@ class SearchO1System:
                 "use_reranker": False
             }
             return get_retriever(retriever_config)
+        elif self.config.retriever_type == "e5":
+            return E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
         else:
             raise ValueError(f"Unsupported retriever type: {self.config.retriever_type}")
     
@@ -524,7 +621,6 @@ class SearchO1System:
             else:
                 result["metrics"] = {"em": 0.0, "f1": 0.0}
             
-        
         # Save intermediate results
         if self.config.save_intermediate:
             self._save_intermediate_results(all_results)
@@ -616,6 +712,7 @@ def main():
     parser.add_argument("--summarizer-model", default="Qwen/Qwen3-32B", help="Summarizer model name")
     parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5"], help="Retriever type")
     parser.add_argument("--retriever-index-path", default="indexes/bm25", help="Path to retriever index")
+    parser.add_argument("--e5-model-path", default="intfloat/e5-large-v2", help="Path to E5 model for retrieval")
     
     # Generation settings
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum number of turns")
@@ -644,6 +741,7 @@ def main():
         summarizer_model_name=args.summarizer_model,
         retriever_type=args.retriever_type,
         retriever_index_path=args.retriever_index_path,
+        e5_model_path=args.e5_model_path,
         max_turns=args.max_turns,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
