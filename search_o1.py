@@ -369,7 +369,7 @@ class SearchO1System:
             
             # Prepare messages for chat template
             messages = [{"role": "user", "content": prompted_question}]
-            initial_sequence = self.tokenizer.apply_chat_template(
+            initial_sequence = self.reasoner.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
