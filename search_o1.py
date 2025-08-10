@@ -380,7 +380,6 @@ class SearchO1System:
                 "question": question_data["question"],
                 "golden_answers": question_data["golden_answers"],
                 "sequence": initial_sequence,  # Initialize sequence with question
-                "full_response": "",  # Track the full response for each question
                 "turns": [],
                 "final_turn": 0,
                 "answer": None,
@@ -423,13 +422,7 @@ class SearchO1System:
                 question_data["turns"].append(turn_info)
                 
                 # Update sequence with the current response
-                question_data["sequence"] += f"{response}"
-                
-                # Update full response
-                if question_data["full_response"]:
-                    question_data["full_response"] += f"\n\n{response}"
-                else:
-                    question_data["full_response"] = response
+                question_data["sequence"] += response
                 
                 logger.info(f"Updated sequence for question {question_data['id']} with response (new length: {len(question_data['sequence'])})")
                 
@@ -531,13 +524,6 @@ class SearchO1System:
             else:
                 result["metrics"] = {"em": 0.0, "f1": 0.0}
             
-            # Clean up temporary fields that shouldn't be in final results
-            if "sequence" in result:
-                del result["sequence"]
-            
-            # Ensure full_response is included in final results
-            if "full_response" not in result:
-                result["full_response"] = ""
         
         # Save intermediate results
         if self.config.save_intermediate:
