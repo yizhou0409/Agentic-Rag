@@ -157,15 +157,108 @@ class E5Retriever:
         return results
 
 
+class LongRAGRetriever:
+    """LongRAG-based retriever using BGE embeddings for long retrieval units."""
+    
+    def __init__(self, index_path: str, model_name: str = "BAAI/bge-large-en-v1.5", device: str = None):
+        self.index_path = Path(index_path)
+        self.model_name = model_name
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Load BGE model (same as LongRAG uses)
+        logger.info(f"Loading LongRAG BGE model: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Load index and metadata
+        logger.info(f"Loading LongRAG index from: {index_path}")
+        self.index, self.corpus = self._load_index()
+        
+        logger.info(f"LongRAG retriever initialized with {len(self.corpus)} long retrieval units")
+    
+    def _load_index(self) -> tuple:
+        """Load the saved index and corpus."""
+        index_path = self.index_path / "longrag_index.faiss"
+        corpus_path = self.index_path / "longrag_corpus.pkl"
+        
+        if not index_path.exists() or not corpus_path.exists():
+            raise FileNotFoundError(f"LongRAG index or corpus files not found: {index_path}, {corpus_path}")
+        
+        # Load index
+        index = faiss.read_index(str(index_path))
+        
+        # Load corpus
+        with open(corpus_path, 'rb') as f:
+            corpus = pickle.load(f)
+            
+        return index, corpus
+    
+    def _generate_embedding(self, text: str) -> np.ndarray:
+        """Generate embedding for a single text using BGE model."""
+        # BGE model doesn't need special prefixes like E5
+        # Tokenize
+        inputs = self.tokenizer(
+            text,
+            max_length=512,
+            padding=True,
+            truncation=True,
+            return_tensors="pt"
+        ).to(self.device)
+        
+        # Generate embedding
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            # Mean pooling
+            attention_mask = inputs['attention_mask']
+            token_embeddings = outputs.last_hidden_state
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            embedding = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            embedding = embedding.cpu().numpy()
+            
+            # Normalize (BGE embeddings are already normalized)
+            faiss.normalize_L2(embedding)
+            
+        return embedding
+    
+    def search(self, query: str, num: int = 10) -> List[Dict[str, Any]]:
+        """Search for long retrieval units similar to the query."""
+        # Generate query embedding
+        query_embedding = self._generate_embedding(query)
+        
+        # Search
+        scores, indices = self.index.search(query_embedding.astype('float32'), num)
+        
+        # Get results
+        results = []
+        for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+            if idx < len(self.corpus):
+                # LongRAG corpus contains long retrieval units (4K tokens)
+                corpus_item = self.corpus[idx]
+                result = {
+                    'text': corpus_item.get('text', str(corpus_item)),
+                    'title': corpus_item.get('title', ''),
+                    'id': corpus_item.get('id', idx),
+                    'score': float(score),
+                    'rank': i + 1,
+                    'length_tokens': corpus_item.get('length_tokens', 0)
+                }
+                results.append(result)
+        
+        return results
+
+
 @dataclass
 class SearchO1Config:
     """Configuration for Search-o1 system."""
     # Model settings
     reasoner_model_name: str = "Qwen/Qwen3-32B"
     summarizer_model_name: str = "Qwen/Qwen3-32B"
-    retriever_type: str = "bm25"  # or "e5"
+    retriever_type: str = "bm25"  # or "e5" or "longrag"
     retriever_index_path: str = "indexes/bm25"
     e5_model_path: str = "intfloat/e5-large-v2"  # Path to E5 model
+    bge_model_path: str = "BAAI/bge-large-en-v1.5"  # Path to BGE model for LongRAG
     
     # Generation settings
     max_turns: int = 5
@@ -397,6 +490,8 @@ class SearchO1System:
             return get_retriever(retriever_config)
         elif self.config.retriever_type == "e5":
             return E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
+        elif self.config.retriever_type == "longrag":
+            return LongRAGRetriever(self.config.retriever_index_path, self.config.bge_model_path)
         else:
             raise ValueError(f"Unsupported retriever type: {self.config.retriever_type}")
     
@@ -474,6 +569,7 @@ class SearchO1System:
                 "question": question_data["question"],
                 "golden_answers": question_data["golden_answers"],
                 "sequence": initial_sequence,  # Initialize sequence with question
+                "response": "",
                 "turns": [],
                 "final_turn": 0,
                 "answer": None,
@@ -518,6 +614,7 @@ class SearchO1System:
                 
                 # Update sequence with the current response
                 question_data["sequence"] += response
+                question_data["response"] += response
                 
                 logger.info(f"Updated sequence for question {question_data['id']} with response (new length: {len(question_data['sequence'])})")
                 
@@ -527,12 +624,10 @@ class SearchO1System:
                     question_data["final_turn"] = turn_num + 1
                     completed_questions.append(question_data)
                     logger.info(f"Question {question_data['id']} answered in turn {turn_num + 1}")
-                    
                 elif search_query:
                     # Need to search, collect search query
                     search_queries[question_data["id"]] = search_query
                     logger.info(f"Question {question_data['id']} searching: {search_query[:50]}...")
-                    
                 else:
                     # No search query or answer found
                     question_data["error"] = "No search query or answer found"
@@ -542,6 +637,7 @@ class SearchO1System:
             
             # Step 2: Remove completed questions from active list
             active_questions = [q for q in active_questions if q["id"] not in [cq["id"] for cq in completed_questions]]
+            logger.info(f"Remaining active questions: {len(active_questions)}, Completed questions: {len(completed_questions)}")
             
             # Step 3: Process all search queries together (if any)
             if search_queries:
@@ -712,9 +808,10 @@ def main():
     # Model settings
     parser.add_argument("--reasoner-model", default="Qwen/Qwen3-32B", help="Reasoner model name")
     parser.add_argument("--summarizer-model", default="Qwen/Qwen3-32B", help="Summarizer model name")
-    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5"], help="Retriever type")
+    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5", "longrag"], help="Retriever type")
     parser.add_argument("--retriever-index-path", default="indexes/bm25", help="Path to retriever index")
     parser.add_argument("--e5-model-path", default="intfloat/e5-large-v2", help="Path to E5 model for retrieval")
+    parser.add_argument("--bge-model-path", default="BAAI/bge-large-en-v1.5", help="Path to BGE model for LongRAG retrieval")
     
     # Generation settings
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum number of turns")
@@ -744,6 +841,7 @@ def main():
         retriever_type=args.retriever_type,
         retriever_index_path=args.retriever_index_path,
         e5_model_path=args.e5_model_path,
+        bge_model_path=args.bge_model_path,
         max_turns=args.max_turns,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
