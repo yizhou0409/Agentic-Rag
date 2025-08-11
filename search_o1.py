@@ -106,7 +106,7 @@ class E5Retriever:
     
     def _generate_embedding(self, text: str) -> np.ndarray:
         """Generate embedding for a single text using E5 model."""
-        # Add prefix for E5
+        # According to E5 documentation, queries should use "query: " prefix
         if not text.startswith("query: "):
             text = f"query: {text}"
         
@@ -257,12 +257,9 @@ class Reasoner:
             )
         
         # Decode response
-        generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        generated_text = self.tokenizer.decode(generated_ids[0][initial_length:], skip_special_tokens=True)
         
-        # Extract only the generated part (after the input)
-        response = generated_text[len(sequence):]
-        
-        return response
+        return generated_text
 
 
 class Summarizer:
@@ -483,8 +480,9 @@ class SearchO1System:
                 "error": None
             })
         
+        max_turn_warning = "Time is up. I am not allowed to search anymore. I should give a final answer now with the information I have."
         # Process all questions together in turns
-        for turn_num in range(self.config.max_turns):
+        for turn_num in range(self.config.max_turns + 1):
             logger.info(f"Processing Turn {turn_num + 1} with {len(active_questions)} active questions")
             
             if not active_questions:
@@ -604,6 +602,10 @@ class SearchO1System:
             
             # Step 4: Check if max turns reached for remaining questions
             if turn_num == self.config.max_turns - 1 and active_questions:
+                for question_data in active_questions:
+                    question_data["sequence"] += max_turn_warning
+                
+            elif turn_num == self.config.max_turns:
                 for question_data in active_questions:
                     question_data["error"] = "Max turns reached"
                     question_data["final_turn"] = self.config.max_turns
