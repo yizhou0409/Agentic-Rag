@@ -157,96 +157,7 @@ class E5Retriever:
         return results
 
 
-class LongRAGRetriever:
-    """LongRAG-based retriever using BGE embeddings for long retrieval units."""
-    
-    def __init__(self, index_path: str, model_name: str = "BAAI/bge-large-en-v1.5", device: str = None):
-        self.index_path = Path(index_path)
-        self.model_name = model_name
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Load BGE model (same as LongRAG uses)
-        logger.info(f"Loading LongRAG BGE model: {model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
-        self.model.to(self.device)
-        self.model.eval()
-        
-        # Load index and metadata
-        logger.info(f"Loading LongRAG index from: {index_path}")
-        self.index, self.corpus = self._load_index()
-        
-        logger.info(f"LongRAG retriever initialized with {len(self.corpus)} long retrieval units")
-    
-    def _load_index(self) -> tuple:
-        """Load the saved index and corpus."""
-        index_path = self.index_path / "longrag_index.faiss"
-        corpus_path = self.index_path / "longrag_corpus.pkl"
-        
-        if not index_path.exists() or not corpus_path.exists():
-            raise FileNotFoundError(f"LongRAG index or corpus files not found: {index_path}, {corpus_path}")
-        
-        # Load index
-        index = faiss.read_index(str(index_path))
-        
-        # Load corpus
-        with open(corpus_path, 'rb') as f:
-            corpus = pickle.load(f)
-            
-        return index, corpus
-    
-    def _generate_embedding(self, text: str) -> np.ndarray:
-        """Generate embedding for a single text using BGE model."""
-        # BGE model doesn't need special prefixes like E5
-        # Tokenize
-        inputs = self.tokenizer(
-            text,
-            max_length=512,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        ).to(self.device)
-        
-        # Generate embedding
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            # Mean pooling
-            attention_mask = inputs['attention_mask']
-            token_embeddings = outputs.last_hidden_state
-            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-            embedding = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-            embedding = embedding.cpu().numpy()
-            
-            # Normalize (BGE embeddings are already normalized)
-            faiss.normalize_L2(embedding)
-            
-        return embedding
-    
-    def search(self, query: str, num: int = 10) -> List[Dict[str, Any]]:
-        """Search for long retrieval units similar to the query."""
-        # Generate query embedding
-        query_embedding = self._generate_embedding(query)
-        
-        # Search
-        scores, indices = self.index.search(query_embedding.astype('float32'), num)
-        
-        # Get results
-        results = []
-        for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-            if idx < len(self.corpus):
-                # LongRAG corpus contains long retrieval units (4K tokens)
-                corpus_item = self.corpus[idx]
-                result = {
-                    'text': corpus_item.get('text', str(corpus_item)),
-                    'title': corpus_item.get('title', ''),
-                    'id': corpus_item.get('id', idx),
-                    'score': float(score),
-                    'rank': i + 1,
-                    'length_tokens': corpus_item.get('length_tokens', 0)
-                }
-                results.append(result)
-        
-        return results
+
 
 
 @dataclass
@@ -255,8 +166,8 @@ class SearchO1Config:
     # Model settings
     reasoner_model_name: str = "Qwen/Qwen3-32B"
     summarizer_model_name: str = "Qwen/Qwen3-32B"
-    retriever_type: str = "bm25"  # or "e5" or "longrag"
-    retriever_index_path: str = "indexes/bm25"
+    retriever_type: str = "bm25"  # or "e5" or "longrag" or "longrag_lazy"
+    retriever_index_path: str = "indexes/bm25"  # Only used for bm25 and e5
     e5_model_path: str = "intfloat/e5-large-v2"  # Path to E5 model
     bge_model_path: str = "BAAI/bge-large-en-v1.5"  # Path to BGE model for LongRAG
     
@@ -274,6 +185,7 @@ class SearchO1Config:
     # Dataset settings
     dataset_name: str = "hotpotqa"  # or "2wikimultihop"
     max_samples: Optional[int] = None
+    max_corpus_size: Optional[int] = None  # For limiting LongRAG corpus size
     
     # Output settings
     output_dir: str = "output/search_o1"
@@ -330,6 +242,7 @@ class Reasoner:
         initial_length = model_inputs['input_ids'].shape[1]
         
         # Create stopping criteria for </search> and </answer> tags
+        # We want to stop after the closing tags, not before them
         stopping_criteria = StoppingCriteriaList([
             StopOnStringCriteria(self.tokenizer, ["</search>", "</answer>"], initial_length)
         ])
@@ -491,7 +404,20 @@ class SearchO1System:
         elif self.config.retriever_type == "e5":
             return E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
         elif self.config.retriever_type == "longrag":
-            return LongRAGRetriever(self.config.retriever_index_path, self.config.bge_model_path)
+            from direct_longrag_retriever import DirectLongRAGRetriever
+            # Map search_o1 dataset names to LongRAG dataset names
+            longrag_dataset = "hotpot_qa" if self.config.dataset_name == "hotpotqa" else "nq"
+            return DirectLongRAGRetriever(dataset_name=longrag_dataset, model_name=self.config.bge_model_path, max_corpus_size=self.config.max_corpus_size)
+        elif self.config.retriever_type == "longrag_lazy":
+            from direct_longrag_retriever import LazyLongRAGRetriever
+            # Map search_o1 dataset names to LongRAG dataset names
+            longrag_dataset = "hotpot_qa" if self.config.dataset_name == "hotpotqa" else "nq"
+            return LazyLongRAGRetriever(dataset_name=longrag_dataset, model_name=self.config.bge_model_path, max_corpus_size=self.config.max_corpus_size)
+        elif self.config.retriever_type == "longrag_persistent":
+            from persistent_longrag_retriever import PersistentLongRAGRetriever
+            # Map search_o1 dataset names to LongRAG dataset names
+            longrag_dataset = "hotpot_qa" if self.config.dataset_name == "hotpotqa" else "nq"
+            return PersistentLongRAGRetriever(dataset_name=longrag_dataset, model_name=self.config.bge_model_path, max_corpus_size=self.config.max_corpus_size)
         else:
             raise ValueError(f"Unsupported retriever type: {self.config.retriever_type}")
     
@@ -577,6 +503,7 @@ class SearchO1System:
             })
         
         max_turn_warning = "Time is up. I am not allowed to search anymore. I should give a final answer now with the information I have."
+        completed_questions = []
         # Process all questions together in turns
         for turn_num in range(self.config.max_turns + 1):
             logger.info(f"Processing Turn {turn_num + 1} with {len(active_questions)} active questions")
@@ -586,7 +513,6 @@ class SearchO1System:
             
             # Step 1: Generate responses for all active questions
             search_queries = {}  # question_id -> search_query
-            completed_questions = []
             
             for question_data in active_questions:
                 # Generate response using the current sequence
@@ -681,6 +607,7 @@ class SearchO1System:
                                     # Append information to the sequence with proper formatting
                                     information_block = f"<information> {summary} </information>"
                                     question_data["sequence"] += information_block
+                                    question_data["response"] += information_block
                                     
                                     logger.info(f"Updated sequence for question {question_id} with information block (length: {len(question_data['sequence'])})")
                                     logger.info(f"Information block added: {information_block[:100]}...")
@@ -808,7 +735,7 @@ def main():
     # Model settings
     parser.add_argument("--reasoner-model", default="Qwen/Qwen3-32B", help="Reasoner model name")
     parser.add_argument("--summarizer-model", default="Qwen/Qwen3-32B", help="Summarizer model name")
-    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5", "longrag"], help="Retriever type")
+    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5", "longrag", "longrag_lazy", "longrag_persistent"], help="Retriever type")
     parser.add_argument("--retriever-index-path", default="indexes/bm25", help="Path to retriever index")
     parser.add_argument("--e5-model-path", default="intfloat/e5-large-v2", help="Path to E5 model for retrieval")
     parser.add_argument("--bge-model-path", default="BAAI/bge-large-en-v1.5", help="Path to BGE model for LongRAG retrieval")
