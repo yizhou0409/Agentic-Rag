@@ -414,10 +414,10 @@ class SearchO1System:
             longrag_dataset = "hotpot_qa" if self.config.dataset_name == "hotpotqa" else "nq"
             return LazyLongRAGRetriever(dataset_name=longrag_dataset, model_name=self.config.bge_model_path, max_corpus_size=self.config.max_corpus_size)
         elif self.config.retriever_type == "longrag_persistent":
-            from persistent_longrag_retriever import PersistentLongRAGRetriever
+            from longrag_retriever import LongRAGRetriever
             # Map search_o1 dataset names to LongRAG dataset names
             longrag_dataset = "hotpot_qa" if self.config.dataset_name == "hotpotqa" else "nq"
-            return PersistentLongRAGRetriever(dataset_name=longrag_dataset, model_name=self.config.bge_model_path, max_corpus_size=self.config.max_corpus_size)
+            return LongRAGRetriever(dataset_name=longrag_dataset, model_name=self.config.bge_model_path, max_corpus_size=self.config.max_corpus_size)
         else:
             raise ValueError(f"Unsupported retriever type: {self.config.retriever_type}")
     
