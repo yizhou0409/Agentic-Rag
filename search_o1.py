@@ -36,7 +36,7 @@ import logging
 
 
 # Import local modules
-from utils import extract_answer_from_text, calculate_metrics
+from utils import calculate_metrics
 
 # Import retriever modules
 from e5_retriever import E5Retriever
