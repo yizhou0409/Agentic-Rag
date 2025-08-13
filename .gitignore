@@ -12,3 +12,6 @@ trained_baseline_models/
 trained_teacher_models/
 enwiki-20171001-pages-meta-current-withlinks-processed/
 wikipedia_e5_index/
+slurm/
+*.sh
+*.json
