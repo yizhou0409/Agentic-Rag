@@ -29,17 +29,18 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList, AutoModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 from tqdm import tqdm
 import logging
-import faiss
 
-# Import FlashRAG retriever
-from flashrag.utils import get_retriever
-from flashrag.config import Config
+
 
 # Import local modules
 from utils import extract_answer_from_text, calculate_metrics
+
+# Import retriever modules
+from e5_retriever import E5Retriever
+from bm25_retriever import BM25Retriever
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -66,95 +67,7 @@ class StopOnStringCriteria(StoppingCriteria):
         return any(stop_string in decoded_new_text for stop_string in self.stop_strings)
 
 
-class E5Retriever:
-    """E5-based retriever for semantic search."""
-    
-    def __init__(self, index_path: str, model_name: str = "intfloat/e5-large-v2", device: str = None):
-        self.index_path = Path(index_path)
-        self.model_name = model_name
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Load E5 model
-        logger.info(f"Loading E5 model: {model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
-        self.model.to(self.device)
-        self.model.eval()
-        
-        # Load index and metadata
-        logger.info(f"Loading E5 index from: {index_path}")
-        self.index, self.chunks = self._load_index()
-        
-        logger.info(f"E5 retriever initialized with {len(self.chunks)} chunks")
-    
-    def _load_index(self) -> tuple:
-        """Load the saved index and metadata."""
-        index_path = self.index_path / "index" / "wikipedia_index.faiss"
-        metadata_path = self.index_path / "metadata" / "chunks.pkl"
-        
-        if not index_path.exists() or not metadata_path.exists():
-            raise FileNotFoundError(f"Index or metadata files not found: {index_path}, {metadata_path}")
-        
-        # Load index
-        index = faiss.read_index(str(index_path))
-        
-        # Load metadata
-        with open(metadata_path, 'rb') as f:
-            chunks = pickle.load(f)
-            
-        return index, chunks
-    
-    def _generate_embedding(self, text: str) -> np.ndarray:
-        """Generate embedding for a single text using E5 model."""
-        # According to E5 documentation, queries should use "query: " prefix
-        if not text.startswith("query: "):
-            text = f"query: {text}"
-        
-        # Tokenize
-        inputs = self.tokenizer(
-            text,
-            max_length=512,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        ).to(self.device)
-        
-        # Generate embedding
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            # Mean pooling
-            attention_mask = inputs['attention_mask']
-            token_embeddings = outputs.last_hidden_state
-            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-            embedding = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-            embedding = embedding.cpu().numpy()
-            
-            # Normalize
-            faiss.normalize_L2(embedding)
-            
-        return embedding
-    
-    def search(self, query: str, num: int = 10) -> List[Dict[str, Any]]:
-        """Search for documents similar to the query."""
-        # Generate query embedding
-        query_embedding = self._generate_embedding(query)
-        
-        # Search
-        scores, indices = self.index.search(query_embedding.astype('float32'), num)
-        
-        # Get results
-        results = []
-        for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-            if idx < len(self.chunks):
-                result = self.chunks[idx].copy()
-                result['score'] = float(score)
-                result['rank'] = i + 1
-                # Ensure the result has a 'text' field for compatibility
-                if 'text' not in result:
-                    result['text'] = result.get('content', str(result))
-                results.append(result)
-        
-        return results
+
 
 
 
@@ -382,25 +295,7 @@ class SearchO1System:
     def _load_retriever(self):
         """Load the appropriate retriever based on configuration."""
         if self.config.retriever_type == "bm25":
-            # Create FlashRAG config for BM25
-            retriever_config = {
-                "retrieval_method": "bm25",
-                "index_path": self.config.retriever_index_path,
-                "corpus_path": os.path.join(self.config.retriever_index_path, "corpus.jsonl"),
-                "bm25_backend": "bm25s",
-                "retrieval_topk": self.config.top_k_docs,
-                "retrieval_batch_size": 32,
-                "retrieval_use_fp16": False,
-                "retrieval_query_max_length": 128,
-                "use_sentence_transformer": True,
-                "faiss_gpu": True,
-                "silent": False,
-                "save_retrieval_cache": False,
-                "use_retrieval_cache": False,
-                "retrieval_cache_path": None,
-                "use_reranker": False
-            }
-            return get_retriever(retriever_config)
+            return BM25Retriever(self.config.retriever_index_path, self.config.top_k_docs)
         elif self.config.retriever_type == "e5":
             return E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
         elif self.config.retriever_type == "longrag":
