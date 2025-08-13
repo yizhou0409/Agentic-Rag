@@ -259,3 +259,44 @@ def extract_reasoning_and_answer(response: str, llm_path: str) -> Tuple[str, str
         raise ValueError(f"Unsupported LLM path: {llm_path}")
     
     return reasoning_output, answer_output
+
+
+def calculate_metrics(prediction: str, golden_answers: list) -> Dict[str, float]:
+    """
+    Calculate evaluation metrics (EM and F1) for a prediction against golden answers.
+    
+    Args:
+        prediction: The predicted answer string.
+        golden_answers: List of golden answer strings.
+        
+    Returns:
+        Dictionary containing 'em' (exact match) and 'f1' scores.
+    """
+    if not prediction:
+        return {"em": 0.0, "f1": 0.0}
+    
+    # Normalize prediction
+    pred_normalized = normalize_answer_qa(prediction)
+    
+    # Calculate metrics against each golden answer
+    best_em = 0.0
+    best_f1 = 0.0
+    
+    for golden_answer in golden_answers:
+        if not golden_answer:
+            continue
+            
+        # Normalize golden answer
+        gold_normalized = normalize_answer_qa(golden_answer)
+        
+        # Calculate exact match
+        em_score = 1.0 if pred_normalized == gold_normalized else 0.0
+        
+        # Calculate F1 score
+        f1_score = string_f1(pred_normalized, gold_normalized)
+        
+        # Update best scores
+        best_em = max(best_em, em_score)
+        best_f1 = max(best_f1, f1_score)
+    
+    return {"em": best_em, "f1": best_f1}
