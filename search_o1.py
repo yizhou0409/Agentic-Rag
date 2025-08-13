@@ -474,7 +474,7 @@ class SearchO1System:
             questions = questions[:self.config.max_samples]
             logger.info(f"Limited to {len(questions)} questions (max_samples: {self.config.max_samples}, original: {original_count})")
         
-        logger.info(f"Processing {len(questions)} questions with sequence-based approach")
+        logger.info(f"Processing {len(questions)} questions")
         
         # Initialize all questions with their sequences
         active_questions = []
@@ -507,6 +507,7 @@ class SearchO1System:
         # Process all questions together in turns
         for turn_num in range(self.config.max_turns + 1):
             logger.info(f"Processing Turn {turn_num + 1} with {len(active_questions)} active questions")
+            logger.info(f"Remaining active questions: {len(active_questions)}, Completed questions: {len(completed_questions)}")
             
             if not active_questions:
                 break
@@ -514,9 +515,8 @@ class SearchO1System:
             # Step 1: Generate responses for all active questions
             search_queries = {}  # question_id -> search_query
             
-            for question_data in active_questions:
+            for question_data in tqdm(active_questions, desc="Processing questions"):
                 # Generate response using the current sequence
-                logger.info(f"Generating response for question {question_data['id']} with sequence length: {len(question_data['sequence'])}")
                 response = self.reasoner.generate_response(
                     question_data["sequence"]
                 )
@@ -524,10 +524,6 @@ class SearchO1System:
                 # Extract search query or answer
                 search_query = self._extract_search_query(response)
                 answer = self._extract_answer(response)
-                
-                logger.info(f"Question {question_data['id']} response: {response[:100]}...")
-                logger.info(f"Extracted search_query: {search_query}")
-                logger.info(f"Extracted answer: {answer}")
                 
                 # Record turn info
                 turn_info = {
@@ -542,8 +538,6 @@ class SearchO1System:
                 question_data["sequence"] += response
                 question_data["response"] += response
                 
-                logger.info(f"Updated sequence for question {question_data['id']} with response (new length: {len(question_data['sequence'])})")
-                
                 if answer:
                     # Question answered, mark as completed
                     question_data["answer"] = answer
@@ -553,7 +547,6 @@ class SearchO1System:
                 elif search_query:
                     # Need to search, collect search query
                     search_queries[question_data["id"]] = search_query
-                    logger.info(f"Question {question_data['id']} searching: {search_query[:50]}...")
                 else:
                     # No search query or answer found
                     question_data["error"] = "No search query or answer found"
@@ -563,12 +556,11 @@ class SearchO1System:
             
             # Step 2: Remove completed questions from active list
             active_questions = [q for q in active_questions if q["id"] not in [cq["id"] for cq in completed_questions]]
-            logger.info(f"Remaining active questions: {len(active_questions)}, Completed questions: {len(completed_questions)}")
+
             
             # Step 3: Process all search queries together (if any)
             if search_queries:
                 logger.info(f"Processing {len(search_queries)} search queries in turn {turn_num + 1}")
-                logger.info(f"Search queries: {list(search_queries.values())}")
                 
                 # Collect all unique search queries to avoid duplicate retrievals
                 unique_queries = list(set(search_queries.values()))
@@ -580,12 +572,10 @@ class SearchO1System:
                     query_to_questions[query].append(question_id)
                 
                 # Process each unique query
-                for query in unique_queries:
-                    logger.info(f"Retrieving documents for query: {query}")
+                for query in tqdm(unique_queries, desc="Processing search queries"):
                     try:
                         # Retrieve documents
                         retrieved_docs = self.retriever.search(query, num=self.config.top_k_docs)
-                        logger.info(f"Retrieved {len(retrieved_docs)} documents")
                         
                         doc_texts = []
                         for doc in retrieved_docs:
@@ -596,9 +586,7 @@ class SearchO1System:
                             doc_texts.append(doc_text)
                         
                         # Summarize documents
-                        logger.info(f"Summarizing {len(doc_texts)} documents")
                         summary = self.summarizer.summarize_documents(query, doc_texts)
-                        logger.info(f"Summary length: {len(summary)} characters")
                         
                         # Update sequence for all questions that used this query
                         for question_id in query_to_questions[query]:
@@ -608,9 +596,6 @@ class SearchO1System:
                                     information_block = f"<information> {summary} </information>"
                                     question_data["sequence"] += information_block
                                     question_data["response"] += information_block
-                                    
-                                    logger.info(f"Updated sequence for question {question_id} with information block (length: {len(question_data['sequence'])})")
-                                    logger.info(f"Information block added: {information_block[:100]}...")
                                     
                                     # Update turn info with retrieval results (but don't include in final results)
                                     for turn_info in question_data["turns"]:
