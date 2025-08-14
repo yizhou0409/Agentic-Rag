@@ -79,10 +79,9 @@ class SearchO1Config:
     # Model settings
     reasoner_model_name: str = "Qwen/Qwen3-32B"
     summarizer_model_name: str = "Qwen/Qwen3-32B"
-    retriever_type: str = "bm25"  # or "e5" or "longrag" or "longrag_lazy"
+    retriever_type: str = "bm25"  # or "e5"
     retriever_index_path: str = "indexes/bm25"  # Only used for bm25 and e5
     e5_model_path: str = "intfloat/e5-large-v2"  # Path to E5 model
-    bge_model_path: str = "BAAI/bge-large-en-v1.5"  # Path to BGE model for LongRAG
     
     # Generation settings
     max_turns: int = 5
@@ -98,7 +97,6 @@ class SearchO1Config:
     # Dataset settings
     dataset_name: str = "hotpotqa"  # or "2wikimultihop"
     max_samples: Optional[int] = None
-    max_corpus_size: Optional[int] = None  # For limiting LongRAG corpus size
     
     # Output settings
     output_dir: str = "output/search_o1"
@@ -298,21 +296,6 @@ class SearchO1System:
             return BM25Retriever(self.config.retriever_index_path, self.config.top_k_docs)
         elif self.config.retriever_type == "e5":
             return E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
-        elif self.config.retriever_type == "longrag":
-            from direct_longrag_retriever import DirectLongRAGRetriever
-            # Map search_o1 dataset names to LongRAG dataset names
-            longrag_dataset = "hotpot_qa" if self.config.dataset_name == "hotpotqa" else "nq"
-            return DirectLongRAGRetriever(dataset_name=longrag_dataset, model_name=self.config.bge_model_path, max_corpus_size=self.config.max_corpus_size)
-        elif self.config.retriever_type == "longrag_lazy":
-            from direct_longrag_retriever import LazyLongRAGRetriever
-            # Map search_o1 dataset names to LongRAG dataset names
-            longrag_dataset = "hotpot_qa" if self.config.dataset_name == "hotpotqa" else "nq"
-            return LazyLongRAGRetriever(dataset_name=longrag_dataset, model_name=self.config.bge_model_path, max_corpus_size=self.config.max_corpus_size)
-        elif self.config.retriever_type == "longrag_persistent":
-            from longrag_retriever import LongRAGRetriever
-            # Map search_o1 dataset names to LongRAG dataset names
-            longrag_dataset = "hotpot_qa" if self.config.dataset_name == "hotpotqa" else "nq"
-            return LongRAGRetriever(dataset_name=longrag_dataset, model_name=self.config.bge_model_path, max_corpus_size=self.config.max_corpus_size)
         else:
             raise ValueError(f"Unsupported retriever type: {self.config.retriever_type}")
     
@@ -615,10 +598,9 @@ def main():
     # Model settings
     parser.add_argument("--reasoner-model", default="Qwen/Qwen3-32B", help="Reasoner model name")
     parser.add_argument("--summarizer-model", default="Qwen/Qwen3-32B", help="Summarizer model name")
-    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5", "longrag", "longrag_lazy", "longrag_persistent"], help="Retriever type")
+    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5"], help="Retriever type")
     parser.add_argument("--retriever-index-path", default="indexes/bm25", help="Path to retriever index")
     parser.add_argument("--e5-model-path", default="intfloat/e5-large-v2", help="Path to E5 model for retrieval")
-    parser.add_argument("--bge-model-path", default="BAAI/bge-large-en-v1.5", help="Path to BGE model for LongRAG retrieval")
     
     # Generation settings
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum number of turns")
@@ -648,7 +630,6 @@ def main():
         retriever_type=args.retriever_type,
         retriever_index_path=args.retriever_index_path,
         e5_model_path=args.e5_model_path,
-        bge_model_path=args.bge_model_path,
         max_turns=args.max_turns,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
