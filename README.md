@@ -21,7 +21,7 @@ python extract_wiki.py --dump_path enwiki-20210620-pages-articles.xml.bz2 --outp
 - `--output_dir`: Directory to store extracted files (default: `temp`)
 - `--num_workers`: Number of parallel processes (adjust as needed)
 
-### 2. Build the E5 Corpus Index(We recommend e5 index. In our inference we also support bm25 retrieval)
+### 2. Build the E5 Corpus Index(We recommend e5 index. In the main.py we also support bm25 retrieval)
 
 Run the `build_e5_corpus.py` script to process the extracted files and build the E5 vector index. You can run this on the full corpus or in parallel splits.
 
@@ -67,7 +67,7 @@ python main.py \
   --dataset hotpotqa \
   --output-dir output/search_e5
 ```
-- Adjust retriever type to shift to bm25 or other retrieval methods
+- Adjust `--retriever-type` to shift to bm25 or other retrieval methods
 - Adjust `--retriever-index-path` to your merged E5 index directory
 - Set `--e5-model-path` to your E5 model location
 
