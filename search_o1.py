@@ -41,6 +41,7 @@ from utils import calculate_metrics
 # Import retriever modules
 from e5_retriever import E5Retriever
 from bm25_retriever import BM25Retriever
+from searchr1_e5_retriever import SearchR1E5Retriever
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -296,6 +297,8 @@ class SearchO1System:
             return BM25Retriever(self.config.retriever_index_path, self.config.top_k_docs)
         elif self.config.retriever_type == "e5":
             return E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
+        elif self.config.retriever_type == "searchr1_e5":
+            return SearchR1E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
         else:
             raise ValueError(f"Unsupported retriever type: {self.config.retriever_type}")
     
@@ -598,7 +601,7 @@ def main():
     # Model settings
     parser.add_argument("--reasoner-model", default="Qwen/Qwen3-32B", help="Reasoner model name")
     parser.add_argument("--summarizer-model", default="Qwen/Qwen3-32B", help="Summarizer model name")
-    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5"], help="Retriever type")
+    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5", "searchr1_e5"], help="Retriever type")
     parser.add_argument("--retriever-index-path", default="indexes/bm25", help="Path to retriever index")
     parser.add_argument("--e5-model-path", default="intfloat/e5-large-v2", help="Path to E5 model for retrieval")
     
