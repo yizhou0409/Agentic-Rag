@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Search-o1: Agentic Search-Enhanced Large Reasoning Models
-
-This implementation reproduces the logic from the Search-o1 paper:
-https://arxiv.org/abs/2501.05366
-
+Inference System for Agentic RAG
 The system consists of three main components:
 1. Reasoner: LLM that performs reasoning and decides when to search
 2. Retriever: Retrieves relevant documents based on search queries
@@ -12,28 +8,16 @@ The system consists of three main components:
 """
 
 import os
-# Set JAX to use CPU backend to avoid CUDA/cuDNN initialization issues
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
-os.environ['JAX_ENABLE_X64'] = 'True'
-# Disable GPU for JAX to prevent cuDNN errors
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-
 import json
 import argparse
 import re
 import yaml
-import pickle
-import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 from tqdm import tqdm
 import logging
-
-
 
 # Import local modules
 from utils import calculate_metrics
@@ -41,49 +25,32 @@ from utils import calculate_metrics
 # Import retriever modules
 from e5_retriever import E5Retriever
 from bm25_retriever import BM25Retriever
-from searchr1_e5_retriever import SearchR1E5Retriever
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class StopOnStringCriteria(StoppingCriteria):
-    """Stopping criteria that stops generation when a specific string is found in newly generated tokens."""
-    
     def __init__(self, tokenizer, stop_strings, initial_length):
         self.tokenizer = tokenizer
         self.stop_strings = stop_strings if isinstance(stop_strings, list) else [stop_strings]
         self.initial_length = initial_length
 
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        # Only check the newly generated tokens (after the initial input)
-        if input_ids.shape[1] <= self.initial_length:
-            return False
-        
-        # Decode only the newly generated part
+    def __call__(self, input_ids, scores):
+        # Check if any of the stop strings are in newly generated tokens
         new_tokens = input_ids[0][self.initial_length:]
-        decoded_new_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-        
-        return any(stop_string in decoded_new_text for stop_string in self.stop_strings)
+        decoded_new_tokens = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
-
-
-
-
-
-
+        return any(stop_string in decoded_new_tokens for stop_string in self.stop_strings)
 
 @dataclass
-class SearchO1Config:
-    """Configuration for Search-o1 system."""
+class InferenceConfig:
     # Model settings
     reasoner_model_name: str = "Qwen/Qwen3-32B"
     summarizer_model_name: str = "Qwen/Qwen3-32B"
     retriever_type: str = "bm25"  # or "e5"
-    retriever_index_path: str = "indexes/bm25"  # Only used for bm25 and e5
-    e5_model_path: str = "intfloat/e5-large-v2"  # Path to E5 model
-    
+    retriever_index_path: str = "indexes/bm25"
+    e5_model_path: str = "intfloat/e5-large-v2"
     # Generation settings
     max_turns: int = 5
     max_new_tokens: int = 2048
@@ -91,23 +58,17 @@ class SearchO1Config:
     top_p: float = 0.95
     top_k: int = 20
     min_p: float = 0.0
-    
     # Retrieval settings
     top_k_docs: int = 10
-    
     # Dataset settings
-    dataset_name: str = "hotpotqa"  # or "2wikimultihop"
+    dataset_name: str = "hotpotqa"
     max_samples: Optional[int] = None
-    
-    # Output settings
     output_dir: str = "output/search_o1"
-    save_intermediate: bool = True
-
+    save_intermediate: bool = False
 
 class Reasoner:
     """The main reasoning model that decides when to search and provides answers."""
-    
-    def __init__(self, model_name: str, config: SearchO1Config):
+    def __init__(self, model_name: str, config: InferenceConfig):
         self.model_name = model_name
         self.config = config
         self.tokenizer = None
@@ -182,8 +143,7 @@ class Reasoner:
 
 class Summarizer:
     """Summarizes retrieved documents for the reasoner."""
-    
-    def __init__(self, model_name: str, config: SearchO1Config):
+    def __init__(self, model_name: str, config: InferenceConfig):
         self.model_name = model_name
         self.config = config
         self.tokenizer = None
@@ -275,30 +235,22 @@ class Summarizer:
         
         # If the expected format is not found, return the full summary
         return summary.strip()
-    
 
 
-
-class SearchO1System:
-    """Main Search-o1 system that coordinates reasoner, retriever, and summarizer."""
-    
-    def __init__(self, config: SearchO1Config):
+class InferenceSystem:
+    """Main system that coordinates reasoner, retriever, and summarizer."""
+    def __init__(self, config: InferenceConfig):
         self.config = config
         self.reasoner = Reasoner(config.reasoner_model_name, config)
         self.summarizer = Summarizer(config.summarizer_model_name, config)
         self.retriever = self._load_retriever()
-        
-        # Create output directory
         os.makedirs(config.output_dir, exist_ok=True)
     
     def _load_retriever(self):
-        """Load the appropriate retriever based on configuration."""
         if self.config.retriever_type == "bm25":
             return BM25Retriever(self.config.retriever_index_path, self.config.top_k_docs)
         elif self.config.retriever_type == "e5":
             return E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
-        elif self.config.retriever_type == "searchr1_e5":
-            return SearchR1E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
         else:
             raise ValueError(f"Unsupported retriever type: {self.config.retriever_type}")
     
@@ -487,7 +439,7 @@ class SearchO1System:
                                     break
                     except Exception as e:
                         logger.error(f"Error processing query '{query}': {e}")
-                        # Continue with other queries
+                    # Continue with other queries
             
             # Step 4: Check if max turns reached for remaining questions
             if turn_num == self.config.max_turns - 1 and active_questions:
@@ -596,22 +548,22 @@ class SearchO1System:
 
 def main():
     """Main function to run Search-o1 system."""
-    parser = argparse.ArgumentParser(description="Search-o1: Agentic Search-Enhanced Large Reasoning Models")
+    parser = argparse.ArgumentParser(description="Agentic RAG Inference System")
     
     # Model settings
     parser.add_argument("--reasoner-model", default="Qwen/Qwen3-32B", help="Reasoner model name")
     parser.add_argument("--summarizer-model", default="Qwen/Qwen3-32B", help="Summarizer model name")
-    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5", "searchr1_e5"], help="Retriever type")
+    parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5"], help="Retriever type")
     parser.add_argument("--retriever-index-path", default="indexes/bm25", help="Path to retriever index")
     parser.add_argument("--e5-model-path", default="intfloat/e5-large-v2", help="Path to E5 model for retrieval")
     
     # Generation settings
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum number of turns")
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.6, help="Generation temperature")
-    parser.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling")
-    parser.add_argument("--top-k", type=int, default=20, help="Top-k sampling")
-    parser.add_argument("--min-p", type=float, default=0.0, help="Min-p sampling")
+    parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
+    parser.add_argument("--top-p", type=float, default=0.95, help="Top-p for nucleus sampling")
+    parser.add_argument("--top-k", type=int, default=20, help="Top-k for sampling")
+    parser.add_argument("--min-p", type=float, default=0.0, help="Min-p for sampling")
     
     # Retrieval settings
     parser.add_argument("--top-k-docs", type=int, default=10, help="Number of documents to retrieve")
@@ -627,7 +579,7 @@ def main():
     args = parser.parse_args()
     
     # Create config
-    config = SearchO1Config(
+    config = InferenceConfig(
         reasoner_model_name=args.reasoner_model,
         summarizer_model_name=args.summarizer_model,
         retriever_type=args.retriever_type,
@@ -647,7 +599,7 @@ def main():
     )
     
     # Create system
-    system = SearchO1System(config)
+    system = InferenceSystem(config)
     
     # Determine dataset path
     if args.dataset == "hotpotqa":
