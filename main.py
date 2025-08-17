@@ -54,10 +54,6 @@ class InferenceConfig:
     # Generation settings
     max_turns: int = 5
     max_new_tokens: int = 2048
-    temperature: float = 0.6
-    top_p: float = 0.95
-    top_k: int = 20
-    min_p: float = 0.0
     # Retrieval settings
     top_k_docs: int = 10
     # Dataset settings
@@ -125,10 +121,10 @@ class Reasoner:
             generated_ids = self.model.generate(
                 **model_inputs,
                 max_new_tokens=self.config.max_new_tokens,
-                temperature=self.config.temperature,
-                top_p=self.config.top_p,
-                top_k=self.config.top_k,
-                min_p=self.config.min_p,
+                temperature=0.6,  # thinking mode
+                top_p=0.95,
+                top_k=20,
+                min_p=0.0,
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
@@ -194,7 +190,8 @@ class Summarizer:
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            enable_thinking=False
         )
         
         # Tokenize input
@@ -205,8 +202,10 @@ class Summarizer:
             generated_ids = self.model.generate(
                 **model_inputs,
                 max_new_tokens=1024,
-                temperature=0.3,  # Lower temperature for more focused summaries
-                top_p=0.9,
+                temperature=0.7,  # non-thinking mode
+                top_p=0.8,
+                top_k=20,
+                min_p=0.0,
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id
@@ -560,10 +559,6 @@ def main():
     # Generation settings
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum number of turns")
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
-    parser.add_argument("--top-p", type=float, default=0.95, help="Top-p for nucleus sampling")
-    parser.add_argument("--top-k", type=int, default=20, help="Top-k for sampling")
-    parser.add_argument("--min-p", type=float, default=0.0, help="Min-p for sampling")
     
     # Retrieval settings
     parser.add_argument("--top-k-docs", type=int, default=10, help="Number of documents to retrieve")
@@ -587,10 +582,6 @@ def main():
         e5_model_path=args.e5_model_path,
         max_turns=args.max_turns,
         max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        min_p=args.min_p,
         top_k_docs=args.top_k_docs,
         dataset_name=args.dataset,
         max_samples=args.max_samples,
