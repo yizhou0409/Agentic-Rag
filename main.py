@@ -215,7 +215,7 @@ class Summarizer:
         generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         
         # Extract only the generated part (after the input)
-        summary = generated_text[len(text):]
+        summary = generated_text[len(text-1):]
         
         # Extract the final summary from the generated text
         # The prompt expects output to start with "### Extracted Information"
