@@ -196,6 +196,7 @@ class Summarizer:
         
         # Tokenize input
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        input_length = model_inputs["input_ids"].shape[1]
         
         # Generate summary
         with torch.no_grad():
@@ -211,11 +212,9 @@ class Summarizer:
                 eos_token_id=self.tokenizer.eos_token_id
             )
         
-        # Decode response
-        generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        
-        # Extract only the generated part (after the input)
-        summary = generated_text[len(text-1):]
+        # Decode only the generated part (after the input tokens)
+        generated_tokens = generated_ids[0][input_length:]
+        summary = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
         
         # Extract the final summary from the generated text
         # The prompt expects output to start with "### Extracted Information"
@@ -502,6 +501,7 @@ class InferenceSystem:
                     if "summary" in turn:
                         del turn["summary"]
             
+            del clean_result["sequence"]
             clean_results.append(clean_result)
         
         # Save detailed results (without retrieved documents)
