@@ -61,6 +61,8 @@ class InferenceConfig:
     max_samples: Optional[int] = None
     output_dir: str = "output/search_o1"
     save_intermediate: bool = False
+    start_sample: Optional[int] = None  # 1-based inclusive
+    end_sample: Optional[int] = None    # 1-based inclusive
 
 class Reasoner:
     """The main reasoning model that decides when to search and provides answers."""
@@ -300,7 +302,13 @@ class InferenceSystem:
         logger.info(f"Loaded {len(questions)} questions from dataset")
         
         # Limit samples if specified
-        if self.config.max_samples:
+        if self.config.start_sample is not None or self.config.end_sample is not None:
+            start = (self.config.start_sample) if self.config.start_sample is not None else 0
+            end = self.config.end_sample if self.config.end_sample is not None else len(questions)
+            original_count = len(questions)
+            questions = questions[start:end]
+            logger.info(f"Selected questions from {start+1} to {end} (total: {len(questions)}, original: {original_count})")
+        elif self.config.max_samples:
             original_count = len(questions)
             questions = questions[:self.config.max_samples]
             logger.info(f"Limited to {len(questions)} questions (max_samples: {self.config.max_samples}, original: {original_count})")
@@ -460,7 +468,7 @@ class InferenceSystem:
                 metrics = calculate_metrics(result["answer"], result["golden_answers"])
                 result["metrics"] = metrics
             else:
-                result["metrics"] = {"em": 0.0, "f1": 0.0}
+                result["metrics"] = {"em": 0.0, "f1": 0.0, "cover_match": 0.0}
             
         # Save intermediate results
         if self.config.save_intermediate:
@@ -522,6 +530,7 @@ class InferenceSystem:
         
         avg_em = sum(r["metrics"]["em"] for r in clean_results) / total_questions
         avg_f1 = sum(r["metrics"]["f1"] for r in clean_results) / total_questions
+        avg_cover_match = sum(r["metrics"]["cover_match"] for r in clean_results) / total_questions
         
         avg_turns = sum(r["final_turn"] for r in clean_results) / total_questions
         
@@ -532,6 +541,7 @@ class InferenceSystem:
             "answer_rate": answered_questions / total_questions,
             "average_em": avg_em,
             "average_f1": avg_f1,
+            "average_cover_match": avg_cover_match,
             "average_turns": avg_turns,
             "config": self.config.__dict__
         }
@@ -542,7 +552,7 @@ class InferenceSystem:
         
         logger.info(f"Results saved to {output_file}")
         logger.info(f"Summary saved to {summary_file}")
-        logger.info(f"Average EM: {avg_em:.3f}, Average F1: {avg_f1:.3f}")
+        logger.info(f"Average EM: {avg_em:.3f}, Average F1: {avg_f1:.3f}, Average Cover Match: {avg_cover_match:.3f}")
 
 
 def main():
@@ -566,6 +576,8 @@ def main():
     # Dataset settings
     parser.add_argument("--dataset", default="hotpotqa", choices=["hotpotqa", "2wikimultihop"], help="Dataset to use")
     parser.add_argument("--max-samples", type=int, default=None, help="Maximum number of samples to process")
+    parser.add_argument("--start-sample", type=int, default=None, help="Start index (1-based, inclusive) of samples to process")
+    parser.add_argument("--end-sample", type=int, default=None, help="End index (1-based, inclusive) of samples to process")
     
     # Output settings
     parser.add_argument("--output-dir", default="output/search_o1", help="Output directory")
@@ -586,7 +598,9 @@ def main():
         dataset_name=args.dataset,
         max_samples=args.max_samples,
         output_dir=args.output_dir,
-        save_intermediate=args.save_intermediate
+        save_intermediate=args.save_intermediate,
+        start_sample=args.start_sample,
+        end_sample=args.end_sample
     )
     
     # Create system
