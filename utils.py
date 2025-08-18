@@ -210,6 +210,27 @@ def normalize_answer_qa(text: str) -> str:
     
     return remove_articles(white_space_fix(remove_punc(lower(text))))
 
+def cover_match(pred: str, target: str) -> float:
+    """
+    Calculate cover match (token overlap ratio) between prediction and target.
+    Measures the proportion of prediction tokens that are covered by the ground-truth answer tokens.
+    Args:
+        pred: Predicted text.
+        target: Ground-truth text.
+    Returns:
+        Cover match score as a float between 0 and 1.
+    """
+    if not pred or not target:
+        return 0.0
+    pred_tokens = pred.split()
+    target_tokens = target.split()
+    if not pred_tokens:
+        return 0.0
+    # Count common tokens with same frequency
+    common = collections.Counter(pred_tokens) & collections.Counter(target_tokens)
+    num_same = sum(common.values())
+    return num_same / len(pred_tokens) if pred_tokens else 0.0
+
 def extract_reasoning_and_answer(response: str, llm_path: str) -> Tuple[str, str]:
     """
     Extract reasoning and answer from model-specific response formats.
@@ -263,40 +284,34 @@ def extract_reasoning_and_answer(response: str, llm_path: str) -> Tuple[str, str
 
 def calculate_metrics(prediction: str, golden_answers: list) -> Dict[str, float]:
     """
-    Calculate evaluation metrics (EM and F1) for a prediction against golden answers.
-    
+    Calculate evaluation metrics (EM, F1, and cover_match) for a prediction against golden answers.
     Args:
         prediction: The predicted answer string.
         golden_answers: List of golden answer strings.
-        
     Returns:
-        Dictionary containing 'em' (exact match) and 'f1' scores.
+        Dictionary containing 'em', 'f1', and 'cover_match' scores.
     """
     if not prediction:
-        return {"em": 0.0, "f1": 0.0}
-    
+        return {"em": 0.0, "f1": 0.0, "cover_match": 0.0}
     # Normalize prediction
     pred_normalized = normalize_answer_qa(prediction)
-    
     # Calculate metrics against each golden answer
     best_em = 0.0
     best_f1 = 0.0
-    
+    best_cover = 0.0
     for golden_answer in golden_answers:
         if not golden_answer:
             continue
-            
         # Normalize golden answer
         gold_normalized = normalize_answer_qa(golden_answer)
-        
         # Calculate exact match
         em_score = 1.0 if pred_normalized == gold_normalized else 0.0
-        
         # Calculate F1 score
         f1_score = string_f1(pred_normalized, gold_normalized)
-        
+        # Calculate cover match
+        cover_score = cover_match(pred_normalized, gold_normalized)
         # Update best scores
         best_em = max(best_em, em_score)
         best_f1 = max(best_f1, f1_score)
-    
-    return {"em": best_em, "f1": best_f1}
+        best_cover = max(best_cover, cover_score)
+    return {"em": best_em, "f1": best_f1, "cover_match": best_cover}
