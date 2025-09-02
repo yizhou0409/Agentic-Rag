@@ -12,6 +12,7 @@ import json
 import argparse
 import re
 import yaml
+import time
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import torch
@@ -63,6 +64,10 @@ class InferenceConfig:
     save_intermediate: bool = False
     start_sample: Optional[int] = None  # 1-based inclusive
     end_sample: Optional[int] = None    # 1-based inclusive
+    # Probe settings
+    use_probe: bool = False
+    probe_path: str = "probe/"
+    probe_confidence_threshold: float = 0.7
 
 class Reasoner:
     """The main reasoning model that decides when to search and provides answers."""
@@ -244,6 +249,14 @@ class InferenceSystem:
         self.reasoner = Reasoner(config.reasoner_model_name, config)
         self.summarizer = Summarizer(config.summarizer_model_name, config)
         self.retriever = self._load_retriever()
+        
+        # Load probe if enabled
+        self.probe = None
+        self.pca = None
+        self.scaler = None
+        if self.config.use_probe:
+            self._load_probe()
+        
         os.makedirs(config.output_dir, exist_ok=True)
     
     def _load_retriever(self):
@@ -253,6 +266,108 @@ class InferenceSystem:
             return E5Retriever(self.config.retriever_index_path, self.config.e5_model_path)
         else:
             raise ValueError(f"Unsupported retriever type: {self.config.retriever_type}")
+    
+    def _load_probe(self):
+        """Load the trained knowledge probe and associated components."""
+        import pickle
+        
+        logger.info(f"Loading probe from {self.config.probe_path}")
+        
+        try:
+            # Load probe configuration
+            config_path = os.path.join(self.config.probe_path, "config.json")
+            if not os.path.exists(config_path):
+                raise FileNotFoundError(f"Probe config file not found: {config_path}")
+            
+            with open(config_path, 'r') as f:
+                probe_config = json.load(f)
+            
+            # Extract probe configuration
+            self.probe_layer = probe_config.get("probe_layer", 32)
+            self.probe_input_dim = probe_config.get("input_dim", 5120)
+            self.probe_pca_dim = probe_config.get("pca_dim", 64)
+            
+            logger.info(f"Probe config loaded: layer={self.probe_layer}, input_dim={self.probe_input_dim}, pca_dim={self.probe_pca_dim}")
+            
+            # Load probe model
+            probe_model_path = os.path.join(self.config.probe_path, "best_probe.pth")
+            if not os.path.exists(probe_model_path):
+                probe_model_path = os.path.join(self.config.probe_path, "final_probe.pth")
+            
+            if not os.path.exists(probe_model_path):
+                raise FileNotFoundError(f"No probe model found in {self.config.probe_path}")
+            
+            # Load PCA and scaler
+            pca_path = os.path.join(self.config.probe_path, "pca.pkl")
+            scaler_path = os.path.join(self.config.probe_path, "scaler.pkl")
+            
+            if not os.path.exists(pca_path) or not os.path.exists(scaler_path):
+                raise FileNotFoundError(f"PCA or scaler files not found in {self.config.probe_path}")
+            
+            # Load components
+            with open(pca_path, 'rb') as f:
+                self.pca = pickle.load(f)
+            
+            with open(scaler_path, 'rb') as f:
+                self.scaler = pickle.load(f)
+            
+            # Load probe model
+            from train_probe import KnowledgeProbe
+            self.probe = KnowledgeProbe(input_dim=self.pca.n_components_)
+            self.probe.load_state_dict(torch.load(probe_model_path, map_location='cpu'))
+            self.probe.eval()
+            
+            logger.info(f"Probe loaded successfully with {self.pca.n_components_} PCA components")
+            
+        except Exception as e:
+            logger.error(f"Failed to load probe: {e}")
+            raise
+    
+    def _get_probe_confidence(self, question: str) -> float:
+        """
+        Get confidence score from the probe for a given question.
+        
+        Args:
+            question: The question to evaluate
+            
+        Returns:
+            float: Confidence score between 0 and 1
+        """
+        if not self.probe:
+            return 0.0
+        
+        try:
+            # Extract hidden states from the reasoner model
+            input_text = f"<search> {question} </search>"
+            inputs = self.reasoner.tokenizer(input_text, return_tensors="pt")
+            input_ids = inputs["input_ids"].to(self.reasoner.model.device)
+            
+            with torch.no_grad():
+                outputs = self.reasoner.model(input_ids, output_hidden_states=True)
+                hidden_states = outputs.hidden_states
+                
+                # Check if target layer is within range
+                if self.probe_layer >= len(hidden_states):
+                    raise ValueError(f"Target layer {self.probe_layer} is out of range. Model has {len(hidden_states)} layers.")
+                
+                # Extract hidden state at the target layer and last token position
+                last_token_pos = input_ids.shape[1] - 1
+                hidden_state = hidden_states[self.probe_layer][0, last_token_pos, :].float().cpu().numpy()
+            
+            # Apply PCA and scaling
+            hidden_state_scaled = self.scaler.transform(hidden_state.reshape(1, -1))
+            hidden_state_pca = self.pca.transform(hidden_state_scaled)
+            
+            # Get probe prediction
+            with torch.no_grad():
+                probe_input = torch.FloatTensor(hidden_state_pca)
+                confidence = self.probe(probe_input).item()
+            
+            return confidence
+            
+        except Exception as e:
+            logger.warning(f"Failed to get probe confidence for question: {question[:50]}... Error: {e}")
+            return 0.0
     
     def _extract_search_query(self, text: str) -> Optional[str]:
         """Extract search query from <search> tags."""
@@ -343,6 +458,16 @@ class InferenceSystem:
         
         max_turn_warning = "Time is up. I am not allowed to search anymore. I should give a final answer now with the information I have."
         completed_questions = []
+        
+        # Initialize probe statistics counters
+        probe_counters = {
+            "total_search_queries": 0,
+            "skipped_retrievals": 0,
+            "performed_retrievals": 0,
+            "self_answered": 0,
+            "retrieved_answered": 0
+        }
+        
         # Process all questions together in turns
         for turn_num in range(self.config.max_turns + 1):
             logger.info(f"Processing Turn {turn_num + 1} with {len(active_questions)} active questions")
@@ -386,6 +511,8 @@ class InferenceSystem:
                 elif search_query:
                     # Need to search, collect search query
                     search_queries[question_data["id"]] = search_query
+                    # Count total search queries
+                    probe_counters["total_search_queries"] += 1
                 else:
                     # No search query or answer found
                     question_data["error"] = "No search query or answer found"
@@ -413,39 +540,112 @@ class InferenceSystem:
                 # Process each unique query
                 for query in tqdm(unique_queries, desc="Processing search queries"):
                     try:
-                        # Retrieve documents
-                        retrieved_docs = self.retriever.search(query, num=self.config.top_k_docs)
+                        # Check probe confidence if probe is enabled
+                        should_retrieve = True
+                        probe_confidence = 0.0
                         
-                        doc_texts = []
-                        for doc in retrieved_docs:
-                            if isinstance(doc, dict):
-                                doc_text = doc.get('text', doc.get('contents', str(doc)))
-                            else:
-                                doc_text = str(doc)
-                            doc_texts.append(doc_text)
-                        
-                        # Summarize documents
-                        summary = self.summarizer.summarize_documents(query, doc_texts)
-                        
-                        # Update sequence for all questions that used this query
-                        for question_id in query_to_questions[query]:
+                        if self.config.use_probe:
+                            # Get the original question for this search query
+                            original_question = None
                             for question_data in active_questions:
-                                if question_data["id"] == question_id:
-                                    # Append information to the sequence with proper formatting
-                                    information_block = f"<information> {summary} </information>"
-                                    question_data["sequence"] += information_block
-                                    question_data["response"] += information_block
-                                    
-                                    # Update turn info with retrieval results (but don't include in final results)
-                                    for turn_info in question_data["turns"]:
-                                        if turn_info["search_query"] == query:
-                                            turn_info["retrieved_docs"] = [str(doc) for doc in retrieved_docs]
-                                            turn_info["summary"] = summary
-                                            break
+                                if question_data["id"] in query_to_questions[query]:
+                                    original_question = question_data["question"]
                                     break
+                            
+                            if original_question:
+                                probe_confidence = self._get_probe_confidence(original_question)
+                                should_retrieve = probe_confidence < self.config.probe_confidence_threshold
+                                
+                                logger.info(f"Query: {query[:50]}... | Probe confidence: {probe_confidence:.4f} | Threshold: {self.config.probe_confidence_threshold} | Should retrieve: {should_retrieve}")
+                        
+                        if should_retrieve:
+                            # Count performed retrieval
+                            probe_counters["performed_retrievals"] += 1
+                            
+                            # Retrieve documents
+                            retrieved_docs = self.retriever.search(query, num=self.config.top_k_docs)
+                            
+                            doc_texts = []
+                            for doc in retrieved_docs:
+                                if isinstance(doc, dict):
+                                    doc_text = doc.get('text', doc.get('contents', str(doc)))
+                                else:
+                                    doc_text = str(doc)
+                                doc_texts.append(doc_text)
+                            
+                            # Summarize documents
+                            summary = self.summarizer.summarize_documents(query, doc_texts)
+                            
+                            # Update sequence for all questions that used this query
+                            for question_id in query_to_questions[query]:
+                                for question_data in active_questions:
+                                    if question_data["id"] == question_id:
+                                        # Append information to the sequence with proper formatting
+                                        information_block = f"<information> {summary} </information>"
+                                        question_data["sequence"] += information_block
+                                        question_data["response"] += information_block
+                                        
+                                        # Update turn info with retrieval results (but don't include in final results)
+                                        for turn_info in question_data["turns"]:
+                                            if turn_info["search_query"] == query:
+                                                turn_info["retrieved_docs"] = [str(doc) for doc in retrieved_docs]
+                                                turn_info["summary"] = summary
+                                                turn_info["probe_confidence"] = probe_confidence
+                                                turn_info["retrieval_skipped"] = False
+                                                break
+                                        break
+                        else:
+                            # Count skipped retrieval
+                            probe_counters["skipped_retrievals"] += 1
+                            
+                            # High confidence - let model answer directly in next turn
+                            # Add probe confidence info and mark for direct answer generation
+                            for question_id in query_to_questions[query]:
+                                for question_data in active_questions:
+                                    if question_data["id"] == question_id:
+                                        for turn_info in question_data["turns"]:
+                                            if turn_info["search_query"] == query:
+                                                turn_info["probe_confidence"] = probe_confidence
+                                                turn_info["retrieval_skipped"] = True
+                                                turn_info["retrieved_docs"] = []
+                                                turn_info["summary"] = f"High probe confidence ({probe_confidence:.4f} >= {self.config.probe_confidence_threshold}) - model will answer directly"
+                                                break
+                                        
+                                        # Add a prompt to encourage the model to answer directly
+                                        # This simulates the model having "retrieved" information from its internal knowledge
+                                        internal_knowledge_prompt = f"Based on my internal knowledge (confidence: {probe_confidence:.4f}), I can answer this question directly without external documents. I will put the answer in <information> </information>. <information>"
+                                        question_data["sequence"] += internal_knowledge_prompt
+                                        question_data["response"] += internal_knowledge_prompt
+                                        break
+                            
+                            logger.info(f"High confidence ({probe_confidence:.4f} >= {self.config.probe_confidence_threshold}) - model will answer directly for query '{query[:50]}...'")
+                            
                     except Exception as e:
                         logger.error(f"Error processing query '{query}': {e}")
                     # Continue with other queries
+                
+                # Count answered questions based on probe decisions
+                if self.config.use_probe:
+                    for question_data in active_questions:
+                        if question_data.get("answer"):
+                            # Check if this question had any skipped retrievals
+                            had_skipped_retrieval = any(
+                                turn.get("retrieval_skipped", False) 
+                                for turn in question_data["turns"] 
+                                if turn.get("search_query")
+                            )
+                            
+                            if had_skipped_retrieval:
+                                probe_counters["self_answered"] += 1
+                            else:
+                                # Check if it had any performed retrievals
+                                had_performed_retrieval = any(
+                                    not turn.get("retrieval_skipped", True) 
+                                    for turn in question_data["turns"] 
+                                    if turn.get("search_query")
+                                )
+                                if had_performed_retrieval:
+                                    probe_counters["retrieved_answered"] += 1
             
             # Step 4: Check if max turns reached for remaining questions
             if turn_num == self.config.max_turns - 1 and active_questions:
@@ -469,7 +669,24 @@ class InferenceSystem:
                 result["metrics"] = metrics
             else:
                 result["metrics"] = {"em": 0.0, "f1": 0.0, "cover_match": 0.0}
+        
+        # Log probe statistics if probe was used
+        if self.config.use_probe:
+            logger.info("="*60)
+            logger.info("PROBE STATISTICS SUMMARY")
+            logger.info("="*60)
+            logger.info(f"Total Search Queries: {probe_counters['total_search_queries']}")
+            logger.info(f"Skipped Retrievals: {probe_counters['skipped_retrievals']}")
+            logger.info(f"Performed Retrievals: {probe_counters['performed_retrievals']}")
+            logger.info(f"Self-Answered: {probe_counters['self_answered']}")
+            logger.info(f"Retrieved-Answered: {probe_counters['retrieved_answered']}")
+            logger.info(f"Confidence Threshold: {self.config.probe_confidence_threshold}")
+            logger.info("="*60)
             
+            # Add probe statistics to all results for later analysis
+            for result in all_results:
+                result["probe_counters"] = probe_counters
+        
         # Save intermediate results
         if self.config.save_intermediate:
             self._save_intermediate_results(all_results)
@@ -557,6 +774,9 @@ class InferenceSystem:
 
 def main():
     """Main function to run Search-o1 system."""
+    # Start timing
+    start_time = time.time()
+    
     parser = argparse.ArgumentParser(description="Agentic RAG Inference System")
     
     # Model settings
@@ -580,10 +800,22 @@ def main():
     parser.add_argument("--end-sample", type=int, default=None, help="End index (1-based, inclusive) of samples to process")
     
     # Output settings
-    parser.add_argument("--output-dir", default="output/search_o1", help="Output directory")
+    parser.add_argument("--output-dir", default=None, help="Output directory (auto-generated if not specified)")
     parser.add_argument("--save-intermediate", action="store_true", help="Save intermediate results")
     
+    # Probe settings
+    parser.add_argument("--use-probe", action="store_true", help="Enable probe-based inference mode")
+    parser.add_argument("--probe-path", default="probe/", help="Path to probe directory containing trained model")
+    parser.add_argument("--probe-confidence-threshold", type=float, default=0.7, help="Confidence threshold above which retrieval is skipped")
+    
     args = parser.parse_args()
+    
+    # Auto-generate output directory if not specified
+    if args.output_dir is None:
+        if args.use_probe:
+            args.output_dir = f"output/search_o1_probe_{args.probe_confidence_threshold}"
+        else:
+            args.output_dir = "output/search_o1"
     
     # Create config
     config = InferenceConfig(
@@ -600,11 +832,24 @@ def main():
         output_dir=args.output_dir,
         save_intermediate=args.save_intermediate,
         start_sample=args.start_sample,
-        end_sample=args.end_sample
+        end_sample=args.end_sample,
+        use_probe=args.use_probe,
+        probe_path=args.probe_path,
+        probe_confidence_threshold=args.probe_confidence_threshold
     )
     
     # Create system
     system = InferenceSystem(config)
+    
+    # Log probe configuration if enabled
+    if config.use_probe:
+        logger.info(f"Probe-based inference mode enabled")
+        logger.info(f"Probe path: {config.probe_path}")
+        logger.info(f"Confidence threshold: {config.probe_confidence_threshold}")
+        logger.info(f"Questions with confidence >= {config.probe_confidence_threshold} will skip retrieval")
+        logger.info("Probe configuration (layer, PCA dim, etc.) will be loaded from probe config file")
+    else:
+        logger.info("Standard inference mode (no probe)")
     
     # Determine dataset path
     if args.dataset == "hotpotqa":
@@ -617,6 +862,22 @@ def main():
     
     # Save results
     system.save_final_results(results, args.dataset)
+    
+    # Calculate and log total running time
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    # Convert to hours, minutes, seconds for readability
+    hours = int(total_time // 3600)
+    minutes = int((total_time % 3600) // 60)
+    seconds = int(total_time % 60)
+    
+    logger.info("="*60)
+    logger.info("TIMING SUMMARY")
+    logger.info("="*60)
+    logger.info(f"Total Running Time: {hours:02d}:{minutes:02d}:{seconds:02d} ({total_time:.2f} seconds)")
+    logger.info(f"Average Time per Question: {total_time/len(results):.2f} seconds")
+    logger.info("="*60)
     
     logger.info("Search-o1 processing completed!")
 
