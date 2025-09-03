@@ -82,4 +82,7 @@ See all options with:
 python main.py --help
 ```
 
-
+Optional, if need to run the pipeline easier, you can modify and run the bash file in the terminal by: 
+```bash
+./test.sh
+```
