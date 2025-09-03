@@ -63,6 +63,25 @@ user_prompt: |-
   5. You final answer should be a short-form answer. Do NOT provide explanations or extract descriptions. For instance, instead of saying "The people who captured Malakoff came to the region where Philipsburg is located in November 12, 1625", you should only say "November 12, 1625".
   6. Your final response should only have the answer enclosed in <answer> and </answer> tags. Do not include any other information or text.
   7. Assume that the current year is 2018. No need to look up information that is more recent than this year.
+
+  ### Search Query Format Guidelines
+  When writing search queries, follow these specific formats depending on what information you need:
+
+  **Format A: When inquiring about an attribute of an entity**
+  Use the pattern: "wh-word is [attribute] of [entity]"
+  Examples:
+  - "What is the capital of France?" (asking about the capital attribute of France entity)
+  - "When is the birthday of Albert Einstein?" (asking about the birthday attribute of Albert Einstein entity)
+  - "Where is the location of Mount Everest?" (asking about the location attribute of Mount Everest entity)
+
+  **Format B: When inquiring about entities that satisfy given values on given attributes**
+  Use the pattern: "wh-word [satisfies the values on given attributes]"
+  Examples:
+  - "Who was born in 1879?" (asking about entities with birth year attribute = 1879)
+  - "Which countries have a population over 100 million?" (asking about entities with population attribute > 100 million)
+  - "What cities are located in California?" (asking about entities with location attribute = California)
+
+  Choose the appropriate format based on whether you're looking for an attribute value of a specific entity (Format A) or searching for entities that match certain criteria (Format B).
   
   Now let's begin!
 
