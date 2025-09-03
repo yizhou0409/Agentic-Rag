@@ -1,4 +1,4 @@
-python main.py \
+python Qi_main.py \
   --retriever-type e5 \
   --retriever-index-path wikipedia_e5_index/merged \
   --e5-model-path /gpfsnyu/scratch/qs2196/.cache/models/e5-large-v2 \
