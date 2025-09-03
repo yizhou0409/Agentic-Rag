@@ -1,0 +1,72 @@
+user_prompt_old: |-
+  ### Instruction
+  Answer the following question from the user with the help of a Wikipedia search engine. Please reason step by step. Begin your reasoning with <think> and end it with </think>. You should think about what you need to know in order to answer the question, and then search for that information. If you decide to search for a piece of information, write a web search query and enclose it with <search> and </search>. You will immediately observe a piece of summarized search results within the <information> and </information> tags. You can then use this retrieved information to continue your reasoning (with <think> and </think> again). Each time you finish your reasoning, you can either search for more information or provide the final answer. To provide final answer, you MUST enclose your final answer with <answer> and </answer>. 
+
+  ### Example
+  Question: When did the people who captured Malakoff come to the region where Philipsburg is located?
+
+  <think> Alright, I need to figure out when the people who captured Malakoff came to the region where Philipsburg is located. I should first find out who were the people that captured Malakoff. I can look it up using the Wikipedia search engine. Let me write a search query. </think>
+  
+  <search> Who were the people that captured Malakoff? </search>
+
+  <information> The French army under General MacMahon successfully captured the Malakoff redoubt on 8th. </information>
+
+  <think> Okay, so the French people captured Malakoff. Now, the next step would be to figure out in what region Philipsburg is located. I will write a web search to look that up. </think>
+
+  <search> Where is Philipsburg located at? </search>
+
+  <information> Philipsburg is the main town and capital of Sint Maarten, a constituent country of the Kingdom of the Netherlands. </information>
+
+  ...[more reasoning shortened]...
+
+  <answer> 1625 </answer>
+
+  ### Reminders
+  1. You should carefully follow the format of thinking, searching, and answering as shown in the example above.
+  2. You should always use the Wikipedia search engine to look up the information needed to answer the question. Do not use your own knowledge or personal experiences.
+  3. The information retrieved are done by external retrieval system. You can always trust the information retrieved with the search query. There is no need to verify it. Don't make any changes to the information.
+  4. You should always generate the full search query. The bad search query may cause the retrieval system to retrieve incorrect information. Here are some examples. Bad query: Albert Einstein's father. Good search query: Who is Albert Einstein's father? Remember always search with the search query of the format: wh-word is the [attribute] of [entity name].
+  5. You final answer should be a short-form answer. Do NOT provide explanations or extract descriptions. For instance, instead of saying "The people who captured Malakoff came to the region where Philipsburg is located in 1625", you should only say "1625".
+  
+  Now let's begin!
+
+  ### Question
+  {question}
+
+user_prompt: |-
+  ### Instruction
+  Answer the following question from the user with the help of a Wikipedia search engine. Please reason step by step. You should think about what you need to know in order to answer the question, and then search for that information using the search engine. To perform a search operation, write a web search question and enclose it with <search> and </search>. You will immediately observe a piece of summarized search results within the <information> and </information> tags. You can then use this retrieved information to continue your reasoning. You can repeat the search process many times. Once you think you have all the information you need, you can end the thinking process and provide the final answer. You MUST enclose your final answer with <answer> and </answer>. 
+
+  ### Example
+  Question: When did the people who captured Malakoff come to the region where Philipsburg is located?
+
+  Your thinking process:
+  Alright, I need to figure out when the people who captured Malakoff came to the region where Philipsburg is located. I should first find out who were the people that captured Malakoff. Let me write a search question to look it up with the Wikipedia search engine.
+  
+  <search> Who were the people that captured Malakoff? </search>
+  <information> The French army under General MacMahon successfully captured the Malakoff redoubt on 8th. </information>
+  
+  Okay, so the French people captured Malakoff. Now, the next step would be to figure out in what region Philipsburg is located. I will write a web search to look that up.
+  
+  <search> Where is Philipsburg located at? </search>
+  <information> Philipsburg is the main town and capital of Sint Maarten, a constituent country of the Kingdom of the Netherlands. </information>
+  
+  ...[more thoughts shortened]...
+
+  Your final response:
+  <answer> November 12, 1625 </answer>
+
+  ### Reminders
+  1. You should carefully follow the format of searching and answering as shown in the example above.
+  2. You should always and directly use the Wikipedia search engine to look up the information needed to answer the question. Do not use your own knowledge or personal experiences to speculate.
+  3. Your search queries should be a complete, natural language question instead of keywords. For instance, instead of searching for "people that captured Malakoff", you should search for "Who were the people that captured Malakoff?".
+  4. The information retrieved are done by external retrieval system. You can always trust the information retrieved with the search query. There is no need to verify it. Don't make any changes to the information.
+  5. You should always generate the full search query. The bad search query may cause the retrieval system to retrieve incorrect information. Here are some examples. Bad query: Albert Einstein's father. Good search query: Who is Albert Einstein's father? Remember always search with the search query of the format: wh-word is the [attribute] of [entity name].
+  6. You final answer should be a short-form answer. Do NOT provide explanations or extract descriptions. For instance, instead of saying "The people who captured Malakoff came to the region where Philipsburg is located in November 12, 1625", you should only say "November 12, 1625".
+  7. Your final response should only have the answer enclosed in <answer> and </answer> tags. Do not include any other information or text.
+  8. Assume that the current year is 2018. No need to look up information that is more recent than this year.
+  
+  Now let's begin!
+
+  ### Question
+  {question}
