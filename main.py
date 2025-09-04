@@ -55,6 +55,7 @@ class InferenceConfig:
     # Generation settings
     max_turns: int = 5
     max_new_tokens: int = 2048
+    greedy_thinking: bool = False  # Use greedy decoding in thinking mode
     # Retrieval settings
     top_k_docs: int = 10
     # Dataset settings
@@ -125,18 +126,31 @@ class Reasoner:
         
         # Generate response with proper stopping criteria
         with torch.no_grad():
-            generated_ids = self.model.generate(
-                **model_inputs,
-                max_new_tokens=self.config.max_new_tokens,
-                temperature=0.6,  # thinking mode
-                top_p=0.95,
-                top_k=20,
-                min_p=0.0,
-                do_sample=True,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                stopping_criteria=stopping_criteria
-            )
+            # Use greedy decoding if specified, otherwise use sampling for thinking mode
+            if self.config.greedy_thinking:
+                logger.debug("Using greedy decoding for thinking mode")
+                generated_ids = self.model.generate(
+                    **model_inputs,
+                    max_new_tokens=self.config.max_new_tokens,
+                    do_sample=False,  # Greedy decoding
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    stopping_criteria=stopping_criteria
+                )
+            else:
+                logger.debug("Using sampling-based decoding for thinking mode")
+                generated_ids = self.model.generate(
+                    **model_inputs,
+                    max_new_tokens=self.config.max_new_tokens,
+                    temperature=0.6,  # thinking mode
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    stopping_criteria=stopping_criteria
+                )
         
         # Decode response
         generated_text = self.tokenizer.decode(generated_ids[0][initial_length:], skip_special_tokens=True)
@@ -789,6 +803,7 @@ def main():
     # Generation settings
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum number of turns")
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum new tokens to generate")
+    parser.add_argument("--greedy-thinking", action="store_true", help="Use greedy decoding in thinking mode (no sampling)")
     
     # Retrieval settings
     parser.add_argument("--top-k-docs", type=int, default=10, help="Number of documents to retrieve")
@@ -826,6 +841,7 @@ def main():
         e5_model_path=args.e5_model_path,
         max_turns=args.max_turns,
         max_new_tokens=args.max_new_tokens,
+        greedy_thinking=args.greedy_thinking,
         top_k_docs=args.top_k_docs,
         dataset_name=args.dataset,
         max_samples=args.max_samples,
@@ -850,6 +866,12 @@ def main():
         logger.info("Probe configuration (layer, PCA dim, etc.) will be loaded from probe config file")
     else:
         logger.info("Standard inference mode (no probe)")
+    
+    # Log generation configuration
+    if config.greedy_thinking:
+        logger.info("Greedy decoding enabled for thinking mode (deterministic reasoning)")
+    else:
+        logger.info("Sampling-based decoding enabled for thinking mode (creative reasoning)")
     
     # Determine dataset path
     if args.dataset == "hotpotqa":
