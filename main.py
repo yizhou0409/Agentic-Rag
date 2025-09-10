@@ -17,6 +17,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from peft import PeftModel
 from tqdm import tqdm
 import logging
 
@@ -49,6 +50,8 @@ class InferenceConfig:
     # Model settings
     reasoner_model_name: str = "Qwen/Qwen3-32B"
     summarizer_model_name: str = "Qwen/Qwen3-32B"
+    reasoner_lora_path: Optional[str] = None  # Path to LoRA adapters for reasoner
+    summarizer_lora_path: Optional[str] = None  # Path to LoRA adapters for summarizer
     retriever_type: str = "bm25"  # or "e5"
     retriever_index_path: str = "indexes/bm25"
     e5_model_path: str = "intfloat/e5-large-v2"
@@ -60,6 +63,7 @@ class InferenceConfig:
     top_k_docs: int = 10
     # Dataset settings
     dataset_name: str = "hotpotqa"
+    split: str = "dev"  # train or dev
     max_samples: Optional[int] = None
     output_dir: str = "output/search_o1"
     save_intermediate: bool = False
@@ -90,6 +94,12 @@ class Reasoner:
             torch_dtype="auto",
             device_map="auto"
         )
+        
+        # Load LoRA adapters if specified
+        if self.config.reasoner_lora_path:
+            logger.info(f"Loading LoRA adapters from: {self.config.reasoner_lora_path}")
+            self.model = PeftModel.from_pretrained(self.model, self.config.reasoner_lora_path)
+            logger.info("LoRA adapters loaded successfully")
         
         logger.info("Reasoner model loaded successfully")
     
@@ -178,6 +188,12 @@ class Summarizer:
             torch_dtype="auto",
             device_map="auto"
         )
+        
+        # Load LoRA adapters if specified
+        if self.config.summarizer_lora_path:
+            logger.info(f"Loading LoRA adapters from: {self.config.summarizer_lora_path}")
+            self.model = PeftModel.from_pretrained(self.model, self.config.summarizer_lora_path)
+            logger.info("LoRA adapters loaded successfully")
         
         logger.info("Summarizer model loaded successfully")
     
@@ -796,6 +812,8 @@ def main():
     # Model settings
     parser.add_argument("--reasoner-model", default="Qwen/Qwen3-32B", help="Reasoner model name")
     parser.add_argument("--summarizer-model", default="Qwen/Qwen3-32B", help="Summarizer model name")
+    parser.add_argument("--reasoner-lora-path", default=None, help="Path to LoRA adapters for reasoner")
+    parser.add_argument("--summarizer-lora-path", default=None, help="Path to LoRA adapters for summarizer")
     parser.add_argument("--retriever-type", default="bm25", choices=["bm25", "e5"], help="Retriever type")
     parser.add_argument("--retriever-index-path", default="indexes/bm25", help="Path to retriever index")
     parser.add_argument("--e5-model-path", default="intfloat/e5-large-v2", help="Path to E5 model for retrieval")
@@ -810,6 +828,7 @@ def main():
     
     # Dataset settings
     parser.add_argument("--dataset", default="hotpotqa", choices=["hotpotqa", "2wikimultihop"], help="Dataset to use")
+    parser.add_argument("--split", default="dev", choices=["train", "dev"], help="Dataset split to use")
     parser.add_argument("--max-samples", type=int, default=None, help="Maximum number of samples to process")
     parser.add_argument("--start-sample", type=int, default=None, help="Start index (1-based, inclusive) of samples to process")
     parser.add_argument("--end-sample", type=int, default=None, help="End index (1-based, inclusive) of samples to process")
@@ -836,6 +855,8 @@ def main():
     config = InferenceConfig(
         reasoner_model_name=args.reasoner_model,
         summarizer_model_name=args.summarizer_model,
+        reasoner_lora_path=args.reasoner_lora_path,
+        summarizer_lora_path=args.summarizer_lora_path,
         retriever_type=args.retriever_type,
         retriever_index_path=args.retriever_index_path,
         e5_model_path=args.e5_model_path,
@@ -844,6 +865,7 @@ def main():
         greedy_thinking=args.greedy_thinking,
         top_k_docs=args.top_k_docs,
         dataset_name=args.dataset,
+        split=args.split,
         max_samples=args.max_samples,
         output_dir=args.output_dir,
         save_intermediate=args.save_intermediate,
@@ -856,6 +878,17 @@ def main():
     
     # Create system
     system = InferenceSystem(config)
+    
+    # Log LoRA configuration if enabled
+    if config.reasoner_lora_path:
+        logger.info(f"LoRA-enabled reasoner: {config.reasoner_lora_path}")
+    else:
+        logger.info("Standard reasoner (no LoRA)")
+    
+    if config.summarizer_lora_path:
+        logger.info(f"LoRA-enabled summarizer: {config.summarizer_lora_path}")
+    else:
+        logger.info("Standard summarizer (no LoRA)")
     
     # Log probe configuration if enabled
     if config.use_probe:
@@ -874,10 +907,7 @@ def main():
         logger.info("Sampling-based decoding enabled for thinking mode (creative reasoning)")
     
     # Determine dataset path
-    if args.dataset == "hotpotqa":
-        dataset_path = "data/hotpotqa/dev.jsonl"
-    else:  # 2wikimultihop
-        dataset_path = "data/2wikimultihop/queries.jsonl"
+    dataset_path = f"data/{args.dataset}/{args.split}.jsonl"
     
     # Process dataset
     results = system.process_dataset(dataset_path)
