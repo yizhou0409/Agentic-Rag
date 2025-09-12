@@ -13,7 +13,7 @@ import argparse
 import re
 import yaml
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
@@ -411,6 +411,302 @@ class InferenceSystem:
         match = re.search(answer_pattern, text, re.DOTALL)
         return match.group(1).strip() if match else None
     
+    def inference_one_turn(self, active_questions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        """
+        Perform one turn of inference for all active questions.
+        
+        Args:
+            active_questions: List of question data with current sequences
+            
+        Returns:
+            Tuple of (updated_active_questions, search_queries_dict)
+        """
+        search_queries = {}  # question_id -> search_query
+        
+        for question_data in active_questions:
+            # Generate response using the current sequence
+            response = self.reasoner.generate_response(question_data["sequence"])
+            
+            # Extract search query or answer
+            search_query = self._extract_search_query(response)
+            answer = self._extract_answer(response)
+            
+            # Record turn info
+            turn_info = {
+                "turn": len(question_data["turns"]) + 1,
+                "response": response,
+                "search_query": search_query,
+                "answer": answer
+            }
+            question_data["turns"].append(turn_info)
+            
+            # Update sequence with the current response
+            question_data["sequence"] += response
+            question_data["response"] += response
+            
+            if search_query:
+                # Need to search, collect search query
+                search_queries[question_data["id"]] = search_query
+        
+        return active_questions, search_queries
+    
+    def process_retrievals(self, active_questions: List[Dict[str, Any]], search_queries: Dict[str, str], probe_counters: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
+        """
+        Process all search queries and update active questions with retrieved information.
+        Includes probe-based confidence handling if probe is enabled.
+        
+        Args:
+            active_questions: List of active question data
+            search_queries: Dictionary mapping question_id to search query
+            probe_counters: Optional probe statistics counter (for compatibility with process_dataset)
+            
+        Returns:
+            Updated active_questions with retrieval information
+        """
+        if not search_queries:
+            return active_questions
+        
+        # Collect all unique search queries to avoid duplicate retrievals
+        unique_queries = list(set(search_queries.values()))
+        query_to_questions = {}
+        
+        for question_id, query in search_queries.items():
+            if query not in query_to_questions:
+                query_to_questions[query] = []
+            query_to_questions[query].append(question_id)
+        
+        # Process each unique query
+        for query in unique_queries:
+            try:
+                # Check probe confidence if probe is enabled
+                should_retrieve = True
+                probe_confidence = 0.0
+                
+                if self.config.use_probe:
+                    # Get the original question for this search query
+                    original_question = None
+                    for question_data in active_questions:
+                        if question_data["id"] in query_to_questions[query]:
+                            original_question = question_data["question"]
+                            break
+                    
+                    if original_question:
+                        probe_confidence = self._get_probe_confidence(original_question)
+                        should_retrieve = probe_confidence < self.config.probe_confidence_threshold
+                        
+                        logger.info(f"Query: {query[:50]}... | Probe confidence: {probe_confidence:.4f} | Threshold: {self.config.probe_confidence_threshold} | Should retrieve: {should_retrieve}")
+                
+                if should_retrieve:
+                    # Count performed retrieval
+                    if probe_counters is not None:
+                        probe_counters["performed_retrievals"] += 1
+                    
+                    # Retrieve documents
+                    retrieved_docs = self.retriever.search(query, num=self.config.top_k_docs)
+                    
+                    doc_texts = []
+                    for doc in retrieved_docs:
+                        if isinstance(doc, dict):
+                            doc_text = doc.get('text', doc.get('contents', str(doc)))
+                        else:
+                            doc_text = str(doc)
+                        doc_texts.append(doc_text)
+                    
+                    # Summarize documents
+                    summary = self.summarizer.summarize_documents(query, doc_texts)
+                    
+                    # Update sequence for all questions that used this query
+                    for question_id in query_to_questions[query]:
+                        for question_data in active_questions:
+                            if question_data["id"] == question_id:
+                                # Append information to the sequence with proper formatting
+                                information_block = f"<information> {summary} </information>"
+                                question_data["sequence"] += information_block
+                                question_data["response"] += information_block
+                                
+                                # Update turn info with retrieval results
+                                for turn_info in question_data["turns"]:
+                                    if turn_info["search_query"] == query:
+                                        turn_info["retrieved_docs"] = [str(doc) for doc in retrieved_docs]
+                                        turn_info["summary"] = summary
+                                        turn_info["probe_confidence"] = probe_confidence
+                                        turn_info["retrieval_skipped"] = False
+                                        break
+                                break
+                else:
+                    # Count skipped retrieval
+                    if probe_counters is not None:
+                        probe_counters["skipped_retrievals"] += 1
+                    
+                    # High confidence - let model answer directly in next turn
+                    # Add probe confidence info and mark for direct answer generation
+                    for question_id in query_to_questions[query]:
+                        for question_data in active_questions:
+                            if question_data["id"] == question_id:
+                                for turn_info in question_data["turns"]:
+                                    if turn_info["search_query"] == query:
+                                        turn_info["probe_confidence"] = probe_confidence
+                                        turn_info["retrieval_skipped"] = True
+                                        turn_info["retrieved_docs"] = []
+                                        turn_info["summary"] = f"High probe confidence ({probe_confidence:.4f} >= {self.config.probe_confidence_threshold}) - model will answer directly"
+                                        break
+                                
+                                # Add a prompt to encourage the model to answer directly
+                                # This simulates the model having "retrieved" information from its internal knowledge
+                                internal_knowledge_prompt = f"Based on my internal knowledge (confidence: {probe_confidence:.4f}), I can answer this question directly without external documents. I will put the answer in <information> </information>. <information>"
+                                question_data["sequence"] += internal_knowledge_prompt
+                                question_data["response"] += internal_knowledge_prompt
+                                break
+                    
+                    logger.info(f"High confidence ({probe_confidence:.4f} >= {self.config.probe_confidence_threshold}) - model will answer directly for query '{query[:50]}...'")
+                    
+            except Exception as e:
+                logger.error(f"Error processing query '{query}': {e}")
+        
+        # Update probe statistics for answered questions (if probe_counters provided)
+        if probe_counters is not None and self.config.use_probe:
+            for question_data in active_questions:
+                if question_data.get("answer"):
+                    # Check if this question had any skipped retrievals
+                    had_skipped_retrieval = any(
+                        turn.get("retrieval_skipped", False) 
+                        for turn in question_data["turns"] 
+                        if turn.get("search_query")
+                    )
+                    
+                    if had_skipped_retrieval:
+                        probe_counters["self_answered"] += 1
+                    else:
+                        # Check if it had any performed retrievals
+                        had_performed_retrieval = any(
+                            not turn.get("retrieval_skipped", True) 
+                            for turn in question_data["turns"] 
+                            if turn.get("search_query")
+                        )
+                        if had_performed_retrieval:
+                            probe_counters["retrieved_answered"] += 1
+        
+        return active_questions
+    
+    def inference(self, questions: List[Dict[str, Any]], max_turns: Optional[int] = None, probe_counters: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
+        """
+        Perform full inference for a list of questions.
+        
+        Args:
+            questions: List of question data with 'id', 'question', 'golden_answers'
+            max_turns: Maximum number of turns (uses config default if None)
+            probe_counters: Optional probe statistics counter (for compatibility with process_dataset)
+            
+        Returns:
+            List of completed question results
+        """
+        if max_turns is None:
+            max_turns = self.config.max_turns
+        
+        # Initialize all questions with their sequences
+        active_questions = []
+        for question_data in questions:
+            # Initialize sequence with the question under prompt template
+            prompted_question = self.reasoner.prompt_template.format(question=question_data["question"])
+            
+            # Prepare messages for chat template
+            messages = [{"role": "user", "content": prompted_question}]
+            initial_sequence = self.reasoner.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True
+            )
+            active_questions.append({
+                "id": question_data["id"],
+                "question": question_data["question"],
+                "golden_answers": question_data["golden_answers"],
+                "sequence": initial_sequence,
+                "response": "",
+                "turns": [],
+                "final_turn": 0,
+                "answer": None,
+                "error": None
+            })
+        
+        max_turn_warning = "Time is up. I am not allowed to search anymore. I should give a final answer now with the information I have."
+        completed_questions = []
+        
+        # Process questions in turns
+        for turn_num in range(max_turns + 1):
+            if not active_questions:
+                break
+            
+            # Step 1: Generate responses for all active questions
+            active_questions, search_queries = self.inference_one_turn(active_questions)
+            
+            # Update probe counters for search queries
+            if probe_counters is not None and search_queries:
+                probe_counters["total_search_queries"] += len(search_queries)
+            
+            # Step 2: Check for completed questions (answered or error)
+            new_completed = []
+            for question_data in active_questions:
+                last_turn = question_data["turns"][-1] if question_data["turns"] else {}
+                answer = last_turn.get("answer")
+                search_query = last_turn.get("search_query")
+                
+                if answer:
+                    # Question answered
+                    question_data["answer"] = answer
+                    question_data["final_turn"] = turn_num + 1
+                    new_completed.append(question_data)
+                elif not search_query:
+                    # No search query or answer found
+                    question_data["error"] = "No search query or answer found"
+                    question_data["final_turn"] = turn_num + 1
+                    new_completed.append(question_data)
+            
+            # Add completed questions to results
+            completed_questions.extend(new_completed)
+            
+            # Remove completed questions from active list
+            active_questions = [q for q in active_questions if q not in new_completed]
+            
+            # Step 3: Process retrievals if any search queries
+            if search_queries:
+                active_questions = self.process_retrievals(active_questions, search_queries, probe_counters)
+            
+            # Step 4: Check if max turns reached
+            if turn_num == max_turns - 1 and active_questions:
+                for question_data in active_questions:
+                    question_data["sequence"] += max_turn_warning
+            elif turn_num == max_turns:
+                for question_data in active_questions:
+                    question_data["error"] = "Max turns reached"
+                    question_data["final_turn"] = max_turns
+                    completed_questions.append(question_data)
+                active_questions = []
+        
+        # Calculate metrics for all results
+        for result in completed_questions:
+            if result["answer"]:
+                from utils import calculate_metrics
+                metrics = calculate_metrics(result["answer"], result["golden_answers"])
+                result["metrics"] = metrics
+            else:
+                result["metrics"] = {"em": 0.0, "f1": 0.0, "cover_match": 0.0}
+        
+        # Log probe statistics if probe was used
+        if self.config.use_probe and probe_counters is not None:
+            logger.info("="*60)
+            logger.info("PROBE STATISTICS SUMMARY")
+            logger.info("="*60)
+            logger.info(f"Total Search Queries: {probe_counters['total_search_queries']}")
+            logger.info(f"Skipped Retrievals: {probe_counters['skipped_retrievals']}")
+            logger.info(f"Performed Retrievals: {probe_counters['performed_retrievals']}")
+            logger.info(f"Self-Answered: {probe_counters['self_answered']}")
+            logger.info(f"Retrieved-Answered: {probe_counters['retrieved_answered']}")
+            logger.info(f"Confidence Threshold: {self.config.probe_confidence_threshold}")
+            logger.info("="*60)
+        
+        return completed_questions
+    
 
     
     def process_dataset(self, dataset_path: str) -> List[Dict[str, Any]]:
@@ -437,11 +733,11 @@ class InferenceSystem:
                         "question": data["question"],
                         "golden_answers": data["golden_answers"]
                     })
-                else:  # 2wikimultihop
+                elif self.config.dataset_name == "2wikimultihop":  # 2wikimultihop
                     questions.append({
                         "id": data["_id"],
-                        "question": data["text"],
-                        "golden_answers": data["metadata"]["answer"]
+                        "question": data["question"],
+                        "golden_answers": data["answer"]
                     })
         
         logger.info(f"Loaded {len(questions)} questions from dataset")
@@ -460,35 +756,6 @@ class InferenceSystem:
         
         logger.info(f"Processing {len(questions)} questions")
         
-        # Initialize all questions with their sequences
-        active_questions = []
-        for question_data in questions:
-            # Initialize sequence with the question under prompt template
-            prompted_question = self.reasoner.prompt_template.format(question=question_data["question"])
-            
-            # Prepare messages for chat template
-            messages = [{"role": "user", "content": prompted_question}]
-            initial_sequence = self.reasoner.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=True
-            )
-            active_questions.append({
-                "id": question_data["id"],
-                "question": question_data["question"],
-                "golden_answers": question_data["golden_answers"],
-                "sequence": initial_sequence,  # Initialize sequence with question
-                "response": "",
-                "turns": [],
-                "final_turn": 0,
-                "answer": None,
-                "error": None
-            })
-        
-        max_turn_warning = "Time is up. I am not allowed to search anymore. I should give a final answer now with the information I have."
-        completed_questions = []
-        
         # Initialize probe statistics counters
         probe_counters = {
             "total_search_queries": 0,
@@ -498,226 +765,15 @@ class InferenceSystem:
             "retrieved_answered": 0
         }
         
-        # Process all questions together in turns
-        for turn_num in range(self.config.max_turns + 1):
-            logger.info(f"Processing Turn {turn_num + 1} with {len(active_questions)} active questions")
-            logger.info(f"Remaining active questions: {len(active_questions)}, Completed questions: {len(completed_questions)}")
-            
-            if not active_questions:
-                break
-            
-            # Step 1: Generate responses for all active questions
-            search_queries = {}  # question_id -> search_query
-            
-            for question_data in tqdm(active_questions, desc="Processing questions"):
-                # Generate response using the current sequence
-                response = self.reasoner.generate_response(
-                    question_data["sequence"]
-                )
-                
-                # Extract search query or answer
-                search_query = self._extract_search_query(response)
-                answer = self._extract_answer(response)
-                
-                # Record turn info
-                turn_info = {
-                    "turn": turn_num + 1,
-                    "response": response,
-                    "search_query": search_query,
-                    "answer": answer
-                }
-                question_data["turns"].append(turn_info)
-                
-                # Update sequence with the current response
-                question_data["sequence"] += response
-                question_data["response"] += response
-                
-                if answer:
-                    # Question answered, mark as completed
-                    question_data["answer"] = answer
-                    question_data["final_turn"] = turn_num + 1
-                    completed_questions.append(question_data)
-                    logger.info(f"Question {question_data['id']} answered in turn {turn_num + 1}")
-                elif search_query:
-                    # Need to search, collect search query
-                    search_queries[question_data["id"]] = search_query
-                    # Count total search queries
-                    probe_counters["total_search_queries"] += 1
-                else:
-                    # No search query or answer found
-                    question_data["error"] = "No search query or answer found"
-                    question_data["final_turn"] = turn_num + 1
-                    completed_questions.append(question_data)
-                    logger.warning(f"Question {question_data['id']}: No search query or answer found")
-            
-            # Step 2: Remove completed questions from active list
-            active_questions = [q for q in active_questions if q["id"] not in [cq["id"] for cq in completed_questions]]
-
-            
-            # Step 3: Process all search queries together (if any)
-            if search_queries:
-                logger.info(f"Processing {len(search_queries)} search queries in turn {turn_num + 1}")
-                
-                # Collect all unique search queries to avoid duplicate retrievals
-                unique_queries = list(set(search_queries.values()))
-                query_to_questions = {}
-                
-                for question_id, query in search_queries.items():
-                    if query not in query_to_questions:
-                        query_to_questions[query] = []
-                    query_to_questions[query].append(question_id)
-                
-                # Process each unique query
-                for query in tqdm(unique_queries, desc="Processing search queries"):
-                    try:
-                        # Check probe confidence if probe is enabled
-                        should_retrieve = True
-                        probe_confidence = 0.0
-                        
-                        if self.config.use_probe:
-                            # Get the original question for this search query
-                            original_question = None
-                            for question_data in active_questions:
-                                if question_data["id"] in query_to_questions[query]:
-                                    original_question = question_data["question"]
-                                    break
-                            
-                            if original_question:
-                                probe_confidence = self._get_probe_confidence(original_question)
-                                should_retrieve = probe_confidence < self.config.probe_confidence_threshold
-                                
-                                logger.info(f"Query: {query[:50]}... | Probe confidence: {probe_confidence:.4f} | Threshold: {self.config.probe_confidence_threshold} | Should retrieve: {should_retrieve}")
-                        
-                        if should_retrieve:
-                            # Count performed retrieval
-                            probe_counters["performed_retrievals"] += 1
-                            
-                            # Retrieve documents
-                            retrieved_docs = self.retriever.search(query, num=self.config.top_k_docs)
-                            
-                            doc_texts = []
-                            for doc in retrieved_docs:
-                                if isinstance(doc, dict):
-                                    doc_text = doc.get('text', doc.get('contents', str(doc)))
-                                else:
-                                    doc_text = str(doc)
-                                doc_texts.append(doc_text)
-                            
-                            # Summarize documents
-                            summary = self.summarizer.summarize_documents(query, doc_texts)
-                            
-                            # Update sequence for all questions that used this query
-                            for question_id in query_to_questions[query]:
-                                for question_data in active_questions:
-                                    if question_data["id"] == question_id:
-                                        # Append information to the sequence with proper formatting
-                                        information_block = f"<information> {summary} </information>"
-                                        question_data["sequence"] += information_block
-                                        question_data["response"] += information_block
-                                        
-                                        # Update turn info with retrieval results (but don't include in final results)
-                                        for turn_info in question_data["turns"]:
-                                            if turn_info["search_query"] == query:
-                                                turn_info["retrieved_docs"] = [str(doc) for doc in retrieved_docs]
-                                                turn_info["summary"] = summary
-                                                turn_info["probe_confidence"] = probe_confidence
-                                                turn_info["retrieval_skipped"] = False
-                                                break
-                                        break
-                        else:
-                            # Count skipped retrieval
-                            probe_counters["skipped_retrievals"] += 1
-                            
-                            # High confidence - let model answer directly in next turn
-                            # Add probe confidence info and mark for direct answer generation
-                            for question_id in query_to_questions[query]:
-                                for question_data in active_questions:
-                                    if question_data["id"] == question_id:
-                                        for turn_info in question_data["turns"]:
-                                            if turn_info["search_query"] == query:
-                                                turn_info["probe_confidence"] = probe_confidence
-                                                turn_info["retrieval_skipped"] = True
-                                                turn_info["retrieved_docs"] = []
-                                                turn_info["summary"] = f"High probe confidence ({probe_confidence:.4f} >= {self.config.probe_confidence_threshold}) - model will answer directly"
-                                                break
-                                        
-                                        # Add a prompt to encourage the model to answer directly
-                                        # This simulates the model having "retrieved" information from its internal knowledge
-                                        internal_knowledge_prompt = f"Based on my internal knowledge (confidence: {probe_confidence:.4f}), I can answer this question directly without external documents. I will put the answer in <information> </information>. <information>"
-                                        question_data["sequence"] += internal_knowledge_prompt
-                                        question_data["response"] += internal_knowledge_prompt
-                                        break
-                            
-                            logger.info(f"High confidence ({probe_confidence:.4f} >= {self.config.probe_confidence_threshold}) - model will answer directly for query '{query[:50]}...'")
-                            
-                    except Exception as e:
-                        logger.error(f"Error processing query '{query}': {e}")
-                    # Continue with other queries
-                
-                # Count answered questions based on probe decisions
-                if self.config.use_probe:
-                    for question_data in active_questions:
-                        if question_data.get("answer"):
-                            # Check if this question had any skipped retrievals
-                            had_skipped_retrieval = any(
-                                turn.get("retrieval_skipped", False) 
-                                for turn in question_data["turns"] 
-                                if turn.get("search_query")
-                            )
-                            
-                            if had_skipped_retrieval:
-                                probe_counters["self_answered"] += 1
-                            else:
-                                # Check if it had any performed retrievals
-                                had_performed_retrieval = any(
-                                    not turn.get("retrieval_skipped", True) 
-                                    for turn in question_data["turns"] 
-                                    if turn.get("search_query")
-                                )
-                                if had_performed_retrieval:
-                                    probe_counters["retrieved_answered"] += 1
-            
-            # Step 4: Check if max turns reached for remaining questions
-            if turn_num == self.config.max_turns - 1 and active_questions:
-                for question_data in active_questions:
-                    question_data["sequence"] += max_turn_warning
-                
-            elif turn_num == self.config.max_turns:
-                for question_data in active_questions:
-                    question_data["error"] = "Max turns reached"
-                    question_data["final_turn"] = self.config.max_turns
-                    completed_questions.append(question_data)
-                active_questions = []
+        # Use the modular inference method
+        all_results = self.inference(questions, probe_counters=probe_counters)
         
-        # Combine all completed questions
-        all_results = completed_questions
-        
-        # Calculate metrics for all results
-        for result in all_results:
-            if result["answer"]:
-                metrics = calculate_metrics(result["answer"], result["golden_answers"])
-                result["metrics"] = metrics
-            else:
-                result["metrics"] = {"em": 0.0, "f1": 0.0, "cover_match": 0.0}
-        
-        # Log probe statistics if probe was used
+        # Add probe statistics to all results for later analysis (preserve original behavior)
         if self.config.use_probe:
-            logger.info("="*60)
-            logger.info("PROBE STATISTICS SUMMARY")
-            logger.info("="*60)
-            logger.info(f"Total Search Queries: {probe_counters['total_search_queries']}")
-            logger.info(f"Skipped Retrievals: {probe_counters['skipped_retrievals']}")
-            logger.info(f"Performed Retrievals: {probe_counters['performed_retrievals']}")
-            logger.info(f"Self-Answered: {probe_counters['self_answered']}")
-            logger.info(f"Retrieved-Answered: {probe_counters['retrieved_answered']}")
-            logger.info(f"Confidence Threshold: {self.config.probe_confidence_threshold}")
-            logger.info("="*60)
-            
-            # Add probe statistics to all results for later analysis
             for result in all_results:
                 result["probe_counters"] = probe_counters
         
-        # Save intermediate results
+        # Save intermediate results if requested
         if self.config.save_intermediate:
             self._save_intermediate_results(all_results)
         
@@ -726,9 +782,12 @@ class InferenceSystem:
     
     def _save_intermediate_results(self, results: List[Dict[str, Any]]):
         """Save intermediate results to file."""
+        # Sort results by question ID/index for consistent output order
+        sorted_results = sorted(results, key=lambda x: x.get("id", ""))
+        
         output_file = os.path.join(self.config.output_dir, "intermediate_results.json")
         with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(sorted_results, f, indent=2)
     
     def save_final_results(self, results: List[Dict[str, Any]], dataset_name: str):
         """Save final results and evaluation metrics."""
@@ -911,6 +970,9 @@ def main():
     
     # Process dataset
     results = system.process_dataset(dataset_path)
+    
+    # Sort results by question ID/index for consistent output order
+    results.sort(key=lambda x: x.get("id", ""))
     
     # Save results
     system.save_final_results(results, args.dataset)
