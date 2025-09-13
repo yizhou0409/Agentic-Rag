@@ -59,6 +59,7 @@ class InferenceConfig:
     max_turns: int = 5
     max_new_tokens: int = 2048
     greedy_thinking: bool = False  # Use greedy decoding in thinking mode
+    high_randomness_mode: bool = False  # Use more aggressive random generation for diverse trajectories
     # Retrieval settings
     top_k_docs: int = 10
     # Dataset settings
@@ -147,8 +148,24 @@ class Reasoner:
                     eos_token_id=self.tokenizer.eos_token_id,
                     stopping_criteria=stopping_criteria
                 )
+            elif self.config.high_randomness_mode:
+                # Use more aggressive random settings for diverse trajectory generation (DPO training)
+                logger.debug("Using high randomness mode for diverse trajectory generation")
+                generated_ids = self.model.generate(
+                    **model_inputs,
+                    max_new_tokens=self.config.max_new_tokens,
+                    temperature=1.2,  # Higher temperature for more randomness
+                    top_p=0.9,        # Higher top_p for more diversity
+                    top_k=40,         # Higher top_k for more token options
+                    min_p=0.05,       # Minimum probability threshold
+                    repetition_penalty=1.1,  # Slight repetition penalty to avoid loops
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    stopping_criteria=stopping_criteria
+                )
             else:
-                logger.debug("Using sampling-based decoding for thinking mode")
+                logger.debug("Using standard sampling-based decoding for thinking mode")
                 generated_ids = self.model.generate(
                     **model_inputs,
                     max_new_tokens=self.config.max_new_tokens,
@@ -588,7 +605,7 @@ class InferenceSystem:
         
         return active_questions
     
-    def inference(self, questions: List[Dict[str, Any]], max_turns: Optional[int] = None, probe_counters: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
+    def inference(self, questions: List[Dict[str, Any]], max_turns: Optional[int] = None, probe_counters: Optional[Dict[str, int]] = None, progress_bar: Optional[tqdm] = None) -> List[Dict[str, Any]]:
         """
         Perform full inference for a list of questions.
         
@@ -596,6 +613,7 @@ class InferenceSystem:
             questions: List of question data with 'id', 'question', 'golden_answers'
             max_turns: Maximum number of turns (uses config default if None)
             probe_counters: Optional probe statistics counter (for compatibility with process_dataset)
+            progress_bar: Optional tqdm progress bar for tracking question completion
             
         Returns:
             List of completed question results
@@ -632,10 +650,15 @@ class InferenceSystem:
         max_turn_warning = "Time is up. I am not allowed to search anymore. I should give a final answer now with the information I have."
         completed_questions = []
         
-        # Process questions in turns
-        for turn_num in range(max_turns + 1):
+        # Process questions in turns with progress tracking
+        turn_pbar = tqdm(range(max_turns + 1), desc="Inference turns", unit="turn", position=1, leave=False) if progress_bar else range(max_turns + 1)
+        for turn_num in turn_pbar:
             if not active_questions:
                 break
+            
+            # Update turn progress bar description
+            if progress_bar and hasattr(turn_pbar, 'set_description'):
+                turn_pbar.set_description(f"Turn {turn_num + 1}/{max_turns + 1} (Active: {len(active_questions)})")
             
             # Step 1: Generate responses for all active questions
             active_questions, search_queries = self.inference_one_turn(active_questions)
@@ -655,12 +678,20 @@ class InferenceSystem:
                     # Question answered
                     question_data["answer"] = answer
                     question_data["final_turn"] = turn_num + 1
+                    logger.info(f"Question {question_data['id']} completed in turn {turn_num + 1}")
                     new_completed.append(question_data)
+                    # Update progress bar
+                    if progress_bar:
+                        progress_bar.update(1)
                 elif not search_query:
                     # No search query or answer found
                     question_data["error"] = "No search query or answer found"
                     question_data["final_turn"] = turn_num + 1
+                    logger.info(f"Question {question_data['id']} completed with error: No search query or answer found")
                     new_completed.append(question_data)
+                    # Update progress bar
+                    if progress_bar:
+                        progress_bar.update(1)
             
             # Add completed questions to results
             completed_questions.extend(new_completed)
@@ -680,7 +711,11 @@ class InferenceSystem:
                 for question_data in active_questions:
                     question_data["error"] = "Max turns reached"
                     question_data["final_turn"] = max_turns
+                    logger.info(f"Question {question_data['id']} completed with error: Max turns reached")
                     completed_questions.append(question_data)
+                    # Update progress bar
+                    if progress_bar:
+                        progress_bar.update(1)
                 active_questions = []
         
         # Calculate metrics for all results
@@ -765,8 +800,9 @@ class InferenceSystem:
             "retrieved_answered": 0
         }
         
-        # Use the modular inference method
-        all_results = self.inference(questions, probe_counters=probe_counters)
+        # Use the modular inference method with progress tracking
+        with tqdm(total=len(questions), desc="Processing questions", unit="question") as pbar:
+            all_results = self.inference(questions, probe_counters=probe_counters, progress_bar=pbar)
         
         # Add probe statistics to all results for later analysis (preserve original behavior)
         if self.config.use_probe:
