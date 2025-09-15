@@ -8,6 +8,30 @@ from hydra.utils import to_absolute_path
 
 TEMPLATE_CACHE: Dict[str, str] = {}
 
+def load_json_or_jsonl(path: str) -> List[dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read().strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        return json.loads(text)
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        items.append(json.loads(line))
+    return items
+
+def load_dataset(data_path: str, max_data_samples: Optional[int] = None) -> List[dict]:
+    items = load_json_or_jsonl(data_path)
+    if not items:
+        raise ValueError(f"No items loaded from {data_path}")
+    # Limit data samples if specified
+    if max_data_samples is not None and max_data_samples > 0:
+        items = items[:max_data_samples]
+    return items
+
 def load_user_message_template(template_dir: str, template_name: str) -> str:
     """
     Load a user message template from a YAML file with caching.
@@ -141,6 +165,23 @@ def parse_summary_generation(response: str) -> Tuple[str, str]:
         return response, information
     else:
         return response, "No useful information is extracted"
+
+def normalize_text(s: str) -> str:
+    """Simple normalization for exact-match (lower + remove punctuation/articles)."""
+    if s is None:
+        return ""
+    s = s.lower()
+    # remove punctuation
+    s = re.sub(r"[^\w\s]", " ", s)
+    # remove articles
+    s = re.sub(r"\b(a|an|the)\b", " ", s)
+    # whitespace collapse
+    s = " ".join(s.split())
+    return s.strip()
+
+
+def is_exact_match(a: str, b: str) -> bool:
+    return normalize_text(a) == normalize_text(b)
 
 """
 Evaluation metrics utilizaitons
