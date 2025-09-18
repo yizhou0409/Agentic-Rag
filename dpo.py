@@ -17,7 +17,6 @@ from peft import PeftModel
 
 from main import InferenceSystem, InferenceConfig, Reasoner, Summarizer
 from utils import load_dataset, is_exact_match, extract_answer, cover_match
-# from models import get_model_device  # Not needed for distributed models
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 

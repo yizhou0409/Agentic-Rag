@@ -32,34 +32,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def get_model_device(model):
-    """
-    Get the appropriate device for a model, handling both single-device and distributed models.
-    
-    Args:
-        model: The model to get device for
-        
-    Returns:
-        torch.device: The device to use for tensors
-    """
-    if hasattr(model, 'device') and model.device.type != 'cpu':
-        # Single device model
-        return model.device
-    else:
-        # For distributed models, we need to be more careful
-        # Try to find the device of the input embedding layer first
-        if hasattr(model, 'get_input_embeddings'):
-            try:
-                embedding_device = next(model.get_input_embeddings().parameters()).device
-                if embedding_device.type != 'cpu':
-                    return embedding_device
-            except:
-                pass
-        
-        # Fallback to the device of the first parameter
-        return next(model.parameters()).device
-
-
 class StopOnStringCriteria(StoppingCriteria):
     def __init__(self, tokenizer, stop_strings, initial_length):
         self.tokenizer = tokenizer
