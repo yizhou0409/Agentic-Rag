@@ -167,6 +167,18 @@ def parse_summary_generation(response: str) -> Tuple[str, str]:
     else:
         return response, "No useful information is extracted"
 
+def extract_answer(text: str) -> str:
+    """Extract content inside <answer>...</answer>. If missing, fallback to last non-empty line."""
+    ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+    if not text:
+        return ""
+    m = ANSWER_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    # fallback
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1] if lines else text.strip()
+
 def normalize_text(s: str) -> str:
     """Simple normalization for exact-match (lower + remove punctuation/articles)."""
     if s is None:
@@ -202,6 +214,9 @@ def string_f1(pred: str, target: str) -> float:
     if not pred or not target:
         return 0.0
     
+    pred = normalize_text(pred)
+    target = normalize_text(target)
+    
     pred_tokens = pred.split()
     target_tokens = target.split()
     
@@ -224,34 +239,6 @@ def string_f1(pred: str, target: str) -> float:
         return 0.0
     return (2 * precision * recall) / (precision + recall)
 
-def normalize_answer_qa(text: str) -> str:
-    """
-    Normalize text for QA evaluation by removing articles, fixing whitespace,
-    converting to lowercase, and removing punctuation.
-    
-    Args:
-        text: Input text to normalize.
-        
-    Returns:
-        Normalized text string.
-    """
-    if not text:
-        return ""
-    
-    def remove_articles(text: str) -> str:
-        return re.sub(r'\b(a|an|the)\b', '', text)
-    
-    def white_space_fix(text: str) -> str:
-        return ' '.join(text.split())
-    
-    def lower(text: str) -> str:
-        return text.lower()
-    
-    def remove_punc(text: str) -> str:
-        return re.sub(f"[{string.punctuation}]", "", text)
-    
-    return remove_articles(white_space_fix(remove_punc(lower(text))))
-
 def cover_match(pred: str, target: str) -> float:
     """
     Calculate cover match (token overlap ratio) between prediction and target.
@@ -262,6 +249,9 @@ def cover_match(pred: str, target: str) -> float:
     Returns:
         Cover match score as a float between 0 and 1.
     """
+    pred = normalize_text(pred)
+    target = normalize_text(target)
+    
     if not pred or not target:
         return 0.0
     pred_tokens = pred.split()
@@ -336,7 +326,7 @@ def calculate_metrics(prediction: str, golden_answers: list) -> Dict[str, float]
     if not prediction:
         return {"em": 0.0, "f1": 0.0, "cover_match": 0.0}
     # Normalize prediction
-    pred_normalized = normalize_answer_qa(prediction)
+    pred_normalized = normalize_text(prediction)
     # Calculate metrics against each golden answer
     best_em = 0.0
     best_f1 = 0.0
@@ -345,7 +335,7 @@ def calculate_metrics(prediction: str, golden_answers: list) -> Dict[str, float]
         if not golden_answer:
             continue
         # Normalize golden answer
-        gold_normalized = normalize_answer_qa(golden_answer)
+        gold_normalized = normalize_text(golden_answer)
         # Calculate exact match
         em_score = 1.0 if pred_normalized == gold_normalized else 0.0
         # Calculate F1 score
@@ -357,3 +347,5 @@ def calculate_metrics(prediction: str, golden_answers: list) -> Dict[str, float]
         best_f1 = max(best_f1, f1_score)
         best_cover = max(best_cover, cover_score)
     return {"em": best_em, "f1": best_f1, "cover_match": best_cover}
+
+

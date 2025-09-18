@@ -428,19 +428,26 @@ class InferenceSystem:
         match = re.search(answer_pattern, text, re.DOTALL)
         return match.group(1).strip() if match else None
     
-    def inference_one_turn(self, active_questions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    def inference_one_turn(self, active_questions: List[Dict[str, Any]], turn_pbar: Optional[tqdm] = None) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         """
         Perform one turn of inference for all active questions.
         
         Args:
             active_questions: List of question data with current sequences
+            turn_pbar: Optional progress bar for turn-level progress
             
         Returns:
             Tuple of (updated_active_questions, search_queries_dict)
         """
         search_queries = {}  # question_id -> search_query
         
-        for question_data in active_questions:
+        # Create progress bar for processing individual questions in this turn
+        question_pbar = tqdm(active_questions, desc="Processing questions", unit="question", position=2, leave=False)
+        
+        for question_data in question_pbar:
+            # Update progress bar to show current question
+            question_pbar.set_description(f"Processing question {question_data['id']}")
+            
             # Generate response using the current sequence
             response = self.reasoner.generate_response(question_data["sequence"])
             
@@ -465,6 +472,7 @@ class InferenceSystem:
                 # Need to search, collect search query
                 search_queries[question_data["id"]] = search_query
         
+        question_pbar.close()
         return active_questions, search_queries
     
     def process_retrievals(self, active_questions: List[Dict[str, Any]], search_queries: Dict[str, str], probe_counters: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
@@ -492,9 +500,15 @@ class InferenceSystem:
                 query_to_questions[query] = []
             query_to_questions[query].append(question_id)
         
+        # Create progress bar for processing search queries
+        query_pbar = tqdm(unique_queries, desc="Processing search queries", unit="query", position=3, leave=False)
+        
         # Process each unique query
-        for query in unique_queries:
+        for query in query_pbar:
             try:
+                # Update progress bar to show current query
+                query_pbar.set_description(f"Processing query: {query[:30]}...")
+                
                 # Check probe confidence if probe is enabled
                 should_retrieve = True
                 probe_confidence = 0.0
@@ -580,6 +594,8 @@ class InferenceSystem:
             except Exception as e:
                 logger.error(f"Error processing query '{query}': {e}")
         
+        query_pbar.close()
+        
         # Update probe statistics for answered questions (if probe_counters provided)
         if probe_counters is not None and self.config.use_probe:
             for question_data in active_questions:
@@ -661,7 +677,7 @@ class InferenceSystem:
                 turn_pbar.set_description(f"Turn {turn_num + 1}/{max_turns + 1} (Active: {len(active_questions)})")
             
             # Step 1: Generate responses for all active questions
-            active_questions, search_queries = self.inference_one_turn(active_questions)
+            active_questions, search_queries = self.inference_one_turn(active_questions, turn_pbar)
             
             # Update probe counters for search queries
             if probe_counters is not None and search_queries:
@@ -680,8 +696,9 @@ class InferenceSystem:
                     question_data["final_turn"] = turn_num + 1
                     logger.info(f"Question {question_data['id']} completed in turn {turn_num + 1}")
                     new_completed.append(question_data)
-                    # Update progress bar
+                    # Update progress bar with question ID
                     if progress_bar:
+                        progress_bar.set_description(f"Completed question {question_data['id']}")
                         progress_bar.update(1)
                 elif not search_query:
                     # No search query or answer found
@@ -689,8 +706,9 @@ class InferenceSystem:
                     question_data["final_turn"] = turn_num + 1
                     logger.info(f"Question {question_data['id']} completed with error: No search query or answer found")
                     new_completed.append(question_data)
-                    # Update progress bar
+                    # Update progress bar with question ID
                     if progress_bar:
+                        progress_bar.set_description(f"Completed question {question_data['id']} (error)")
                         progress_bar.update(1)
             
             # Add completed questions to results
@@ -713,8 +731,9 @@ class InferenceSystem:
                     question_data["final_turn"] = max_turns
                     logger.info(f"Question {question_data['id']} completed with error: Max turns reached")
                     completed_questions.append(question_data)
-                    # Update progress bar
+                    # Update progress bar with question ID
                     if progress_bar:
+                        progress_bar.set_description(f"Completed question {question_data['id']} (max turns)")
                         progress_bar.update(1)
                 active_questions = []
         

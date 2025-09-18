@@ -1,25 +1,3 @@
-#!/usr/bin/env python3
-"""
-train_dpo.py
-
-ON-POLICY DPO training script that:
-- uses Reasoner from main.py to sample trajectories (so generation matches inference)
-- processes each question sequentially: generate trajectories → train immediately → move to next question
-- masks tokens inside <information>...</information> in continuations when computing log-probs
-- constructs (pos, neg) pairs per your rules and trains via DPO objective
-- updates model after each question (true on-policy training)
-
-Usage example:
-python train_dpo.py \
-  --data dpo_training_data.json \
-  --base-model /scratch/yl9038/models/Qwen3-0.6B \
-  --lora-adapter models/llamafactory/qwen3-lora-0.6B \
-  --output-dir dpo_out \
-  --device cuda \
-  --epochs 1
-
-"""
-
 import argparse
 import json
 import logging
@@ -36,50 +14,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.optim import AdamW
 from peft import PeftModel
 
-# Import Reasoner and InferenceConfig from your main.py
-# main.py must be next to this script and must not execute its main() on import (your main.py uses if __name__ == "__main__":)
 from main import InferenceSystem, InferenceConfig
-from utils import load_dataset, is_exact_match
+from utils import load_dataset, is_exact_match, extract_answer, cover_match
+from models import get_model_device
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-
-# -----------------------------
-# Answer extraction / normalization
-# -----------------------------
-ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
-
-def extract_answer_from_trajectory(text: str) -> str:
-    """Extract content inside <answer>...</answer>. If missing, fallback to last non-empty line."""
-    if not text:
-        return ""
-    m = ANSWER_RE.search(text)
-    if m:
-        return m.group(1).strip()
-    # fallback
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    return lines[-1] if lines else text.strip()
-
-
-# -----------------------------
-# Device management utilities
-# -----------------------------
-def get_model_device(model: torch.nn.Module) -> torch.device:
-    """
-    Get the device of the model's first parameter.
-    This is useful for multi-GPU models where different parameters might be on different devices.
-    """
-    return next(model.parameters()).device
-
-def ensure_tensor_on_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """
-    Ensure a tensor is on the specified device.
-    Returns the tensor moved to the device if needed.
-    """
-    if tensor.device != device:
-        return tensor.to(device)
-    return tensor
 
 # -----------------------------
 # Masked log-prob calculation
@@ -98,25 +38,12 @@ def compute_masked_logprob(
     Returns a single-scalar torch.Tensor (sum of selected token log-probs).
     Gradients flow back to model parameters (do NOT wrap in torch.no_grad()).
     """
-    if continuation is None:
-        continuation = ""
-    if continuation == "":
-        # Return zero tensor on the specified device
-        if return_length:
-            return torch.tensor(0.0, device=device, dtype=torch.float32), 0
-        return torch.tensor(0.0, device=device, dtype=torch.float32)
 
     # Find information spans in continuation (character offsets relative to continuation)
     info_spans: List[Tuple[int, int]] = []
     for m in re.finditer(r"<information>.*?</information>", continuation, flags=re.DOTALL | re.IGNORECASE):
         info_spans.append((m.start(), m.end()))
     
-    # Debug: log information spans found
-    if info_spans:
-        logger.debug(f"Found {len(info_spans)} information spans in continuation of length {len(continuation)}")
-        for i, (start, end) in enumerate(info_spans):
-            logger.debug(f"Info span {i}: chars {start}-{end}, content preview: {continuation[start:min(start+50, end)]}...")
-
     # Tokenize prompt and continuation separately (so offsets for continuation are relative to continuation text)
     enc_prompt = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     enc_cont = tokenizer(
@@ -140,25 +67,17 @@ def compute_masked_logprob(
     outputs = model(input_ids, return_dict=True)
     logits = outputs.logits  # (1, seq_len, vocab_size)
 
-    # Positions predicting continuation tokens:
-    # predictions at positions cont_start .. seq_len-1 are predicted by logits at cont_start-1 .. seq_len-2
-    if seq_len - cont_start <= 0:
-        if return_length:
-            return torch.tensor(0.0, device=device, dtype=torch.float32), 0
-        return torch.tensor(0.0, device=device, dtype=torch.float32)
-
     # Create position tensors directly on the specified device to avoid device mismatch
     pred_pos = torch.arange(cont_start - 1, seq_len - 1, device=device, dtype=torch.long)
     target_pos = torch.arange(cont_start, seq_len, device=device, dtype=torch.long)
 
     logits_preds = logits[0, pred_pos, :]  # shape (num_cont_tokens, vocab)
-    target_ids = input_ids[0, target_pos]  # shape (num_cont_tokens,)
+    target_ids = input_ids[0, target_pos].long()  # shape (num_cont_tokens,) - ensure LongTensor
 
     log_probs = F.log_softmax(logits_preds, dim=-1)
     token_log_probs = log_probs.gather(1, target_ids.unsqueeze(-1)).squeeze(-1)  # (num_cont_tokens,)
 
     # Build mask: True for tokens to KEEP (not in <information>), False to drop
-    # Ensure mask is on the same device as token_log_probs
     keep_mask = torch.ones_like(token_log_probs, dtype=torch.bool, device=token_log_probs.device)
     masked_tokens = 0
     for i, (tok_start, tok_end) in enumerate(offsets):
@@ -170,21 +89,11 @@ def compute_masked_logprob(
                 masked_tokens += 1
                 break
     
-    # Debug: log masking statistics
-    total_tokens = len(keep_mask)
-    kept_tokens = keep_mask.sum().item()
-    logger.debug(f"Masking: {masked_tokens}/{total_tokens} tokens masked, {kept_tokens}/{total_tokens} tokens kept")
-
     # Sum log-probs over kept tokens
     if keep_mask.sum().item() == 0:
         # no tokens to train on in this continuation
         logger.warning(f"All tokens masked out in continuation. Total tokens: {len(keep_mask)}, Info spans: {len(info_spans)}")
         
-        # Debug: show what content remains after removing information blocks
-        remaining_content = continuation
-        for (start, end) in reversed(info_spans):  # Reverse to maintain indices
-            remaining_content = remaining_content[:start] + remaining_content[end:]
-        logger.warning(f"Content after removing info blocks: '{remaining_content.strip()}'")
         
         if return_length:
             return torch.tensor(0.0, device=token_log_probs.device, dtype=torch.float32), 0
@@ -194,78 +103,11 @@ def compute_masked_logprob(
     total_log_prob = kept_log_probs.sum()
     num_kept_tokens = keep_mask.sum().item()
     
-    # Debug logging for very small or zero log probabilities
-    if abs(total_log_prob.item()) < 1e-6:
-        logger.debug(f"Very small log probability: {total_log_prob.item():.8f} | Kept tokens: {keep_mask.sum().item()}/{len(keep_mask)} | Info spans: {len(info_spans)}")
-        
-        # Show some examples of kept vs masked tokens
-        kept_token_indices = torch.where(keep_mask)[0][:10]  # First 10 kept tokens
-        masked_token_indices = torch.where(~keep_mask)[0][:10]  # First 10 masked tokens
-        
-        if len(kept_token_indices) > 0:
-            kept_tokens_text = [tokenizer.decode([cont_ids[0][idx]]) for idx in kept_token_indices]
-            logger.debug(f"Sample kept tokens: {kept_tokens_text}")
-        
-        if len(masked_token_indices) > 0:
-            masked_tokens_text = [tokenizer.decode([cont_ids[0][idx]]) for idx in masked_token_indices]
-            logger.debug(f"Sample masked tokens: {masked_tokens_text}")
-    
     if return_length:
         return total_log_prob, num_kept_tokens
     return total_log_prob
 
 
-def test_masking_logic():
-    """
-    Test function to verify that masking logic handles multiple information blocks correctly.
-    This can be called for debugging purposes.
-    """
-    test_continuation = """
-    <thinking>
-    I need to solve this problem step by step.
-    </thinking>
-    
-    <information>
-    Some external knowledge here.
-    </information>
-    
-    <thinking>
-    Based on the information, I can proceed.
-    </thinking>
-    
-    <information>
-    More external knowledge here.
-    </information>
-    
-    <answer>
-    The final answer is 42.
-    </answer>
-    """
-    
-    # Test regex to find information spans
-    info_spans = []
-    for m in re.finditer(r"<information>.*?</information>", test_continuation, flags=re.DOTALL | re.IGNORECASE):
-        info_spans.append((m.start(), m.end()))
-    
-    print(f"Found {len(info_spans)} information spans:")
-    for i, (start, end) in enumerate(info_spans):
-        print(f"  Span {i}: chars {start}-{end}")
-        print(f"  Content: {test_continuation[start:end][:100]}...")
-    
-    # Test what remains after removing info blocks
-    remaining_content = test_continuation
-    for (start, end) in reversed(info_spans):
-        remaining_content = remaining_content[:start] + remaining_content[end:]
-    
-    print(f"\nContent after removing info blocks:")
-    print(f"'{remaining_content.strip()}'")
-    
-    return info_spans, remaining_content
-
-
-# -----------------------------
-# On-policy trajectory generation (per question)
-# -----------------------------
 def generate_trajectories_for_question(
     system,  # InferenceSystem type
     question_data: Dict[str, Any],
@@ -285,7 +127,6 @@ def generate_trajectories_for_question(
     Returns:
         List of trajectory results for this question
     """
-    logger.debug(f"Generating {sample_trajectories} trajectories for question {question_data['id']}")
     
     # Create question copies for this single question
     question_copies = []
@@ -300,17 +141,9 @@ def generate_trajectories_for_question(
     
     # Generate trajectories for this question
     try:
-        logger.debug(f"Calling system.inference for question {question_data['id']}...")
         results = system.inference(question_copies, max_turns=max_turns)
-        logger.debug(f"Generated {len(results)} results for question {question_data['id']}")
-        
         # Sort results by trajectory index to ensure consistent order
         results.sort(key=lambda x: x.get("trajectory_idx", -1))
-        
-        # Ensure we have the right number of trajectories (fill with None if missing)
-        while len(results) < sample_trajectories:
-            logger.warning(f"Missing trajectory for question {question_data['id']}, adding None")
-            results.append(None)
         
         return results
         
@@ -320,20 +153,6 @@ def generate_trajectories_for_question(
         return [None] * sample_trajectories
 
 
-def extract_trajectory_text(trajectory_result: Dict[str, Any]) -> str:
-    """
-    Extract the full trajectory text from a trajectory result.
-    
-    Args:
-        trajectory_result: Result from system.inference()
-        
-    Returns:
-        Full trajectory text (response field)
-    """
-    if trajectory_result is None:
-        return ""
-    
-    return trajectory_result.get("response", "")
 
 
 # -----------------------------
@@ -379,7 +198,6 @@ def train_dpo(
     os.makedirs(output_dir, exist_ok=True)
 
     device_t = torch.device(device)
-    logger.info(f"Using manual device management. Device: {device_t}")
 
     # Load dataset
     logger.info(f"Loading dataset from {data_path}...")
@@ -397,18 +215,7 @@ def train_dpo(
         prompt = it.get("instruction") or it.get("prompt")
         input_text = it.get("input")
         ref_traj = it.get("reference_trajectory") or it.get("ref") or it.get("reference") or it.get("output")
-        
-        # Validate required fields
-        if not qid:
-            logger.warning(f"Skipping item missing id: {it}")
-            continue
-        if not prompt:
-            logger.warning(f"Skipping item {qid} missing prompt: {it}")
-            continue
-        if not input_text:
-            logger.warning(f"Skipping item {qid} missing input: {it}")
-            continue
-        
+
         # Build conversation from prompt and input (similar to SFT format)
         if input_text:
             # Use input as the main question, prompt as context
@@ -458,48 +265,37 @@ def train_dpo(
     tokenizer = system.reasoner.tokenizer
     logger.info("InferenceSystem initialized successfully")
 
-    # Prepare base model + apply LoRA adapter (for training)
-    logger.info(f"Loading base model for training from {base_model_path} ...")
+    # Use the SAME reasoner model from InferenceSystem for training (true on-policy training)
+    logger.info("Using the same reasoner model from InferenceSystem for training...")
+    model = system.reasoner.model  # This is the exact same model used for generation
     
-    # For multi-GPU setups, we'll use a single device approach to avoid device_map issues
-    # This ensures all model parameters are on the same device for consistent training
-    if torch.cuda.device_count() > 1:
-        logger.info(f"Multiple CUDA devices detected ({torch.cuda.device_count()}). Using single device approach for training.")
-        logger.info("Note: For true multi-GPU training, consider using DistributedDataParallel or similar.")
-    
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_path, 
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True
-    )
-    model = base_model
-    if lora_adapter_path and os.path.isdir(lora_adapter_path):
-        logger.info(f"Applying LoRA adapter from {lora_adapter_path} (PEFT)...")
-        model = PeftModel.from_pretrained(model, lora_adapter_path, is_trainable=True)
+    # MERGE LoRA ADAPTER INTO BASE MODEL (if LoRA is present)
+    if hasattr(model, 'merge_and_unload'):
+        logger.info("Merging LoRA adapter into base model parameters...")
+        model = model.merge_and_unload()  # This merges LoRA weights into base model
+        logger.info("LoRA adapter successfully merged into base model")
+    elif hasattr(model, 'base_model') and hasattr(model.base_model, 'merge_and_unload'):
+        logger.info("Merging LoRA adapter into base model parameters...")
+        model = model.base_model.merge_and_unload()  # For nested PEFT models
+        logger.info("LoRA adapter successfully merged into base model")
     else:
-        logger.info("No LoRA adapter specified or not found. Training will fine-tune the base model (may be very large).")
-
+        logger.info("No LoRA adapter found to merge, using base model directly")
+    
+    # Set model to training mode
     model.train()
     
-    # Move model to the specified device
-    logger.info(f"Moving model to {device_t}...")
-    model = model.to(device_t)
-    logger.info(f"Model moved to {device_t}")
+    # Enable all parameters for training (full fine-tuning after LoRA merge)
+    for param in model.parameters():
+        param.requires_grad = True
     
-    # Prepare optimizer for trainable params only (PEFT ensures only adapter params require grad)
+    # Prepare optimizer for all parameters (full model training)
     trainable = [p for p in model.parameters() if p.requires_grad]
     logger.info(f"Number of trainable params: {sum(p.numel() for p in trainable):,}")
+    logger.info("Training full model (LoRA merged + base model parameters)")
+    
     optimizer = AdamW(trainable, lr=lr)
     
-    # Verify model is on the correct device
-    model_device = get_model_device(model)
-    logger.info(f"Model device: {model_device}")
-    if torch.cuda.is_available():
-        logger.info(f"Available CUDA devices: {torch.cuda.device_count()}")
-        for i in range(torch.cuda.device_count()):
-            logger.info(f"CUDA device {i}: {torch.cuda.get_device_name(i)}")
     
-    logger.info("Model and optimizer prepared successfully")
 
     global_step = 0
 
@@ -533,7 +329,6 @@ def train_dpo(
             logger.info(f"Processing question {question_idx + 1}/{len(normalized)}: {qid}")
             
             # Step 1: Generate trajectories for this question using current model state
-            logger.debug(f"Generating {sample_trajectories} trajectories for question {qid}")
             question_trajectories = generate_trajectories_for_question(
                 system, question_data, sample_trajectories, max_turns=5
             )
@@ -542,23 +337,23 @@ def train_dpo(
             total_trajectories_generated += len(question_trajectories)
             valid_trajectories_generated += len([t for t in question_trajectories if t is not None])
             
-            # Convert trajectory results to text
-            trajectories = [extract_trajectory_text(traj) for traj in question_trajectories]
-            
             # Extract answers from each trajectory and from the reference trajectory
-            traj_answers = [extract_answer_from_trajectory(t) for t in trajectories]
-            ref_answer = extract_answer_from_trajectory(reference_traj)
+            traj_answers = [extract_answer(t["response"]) for t in question_trajectories]
+            ref_answer = extract_answer(reference_traj)
             
             # Decide correctness by comparing extracted answers to reference answer (exact-match normalized)
             correctness = []
+            n_correct = 0
             for ans in traj_answers:
-                if ref_answer:
-                    correctness.append(is_exact_match(ans, ref_answer))
+                if cover_match(ref_answer, ans) or is_exact_match(ref_answer, ans):
+                    correctness.append(True)
+                    n_correct += 1
+                elif not ans:
+                    correctness.append("No Answer")
                 else:
                     # if no ref answer we mark as False (so that if all wrong we skip)
                     correctness.append(False)
             
-            n_correct = sum(correctness)
             n_total = len(correctness)
             
             # DPO pairing logic:
@@ -581,10 +376,10 @@ def train_dpo(
             # Case: at least one correct AND at least one wrong
             if n_correct >= 1 and (n_total - n_correct) >= 1:
                 pos_idx = correctness.index(True)
-                neg_idx = correctness.index(False)
-                pos_traj = trajectories[pos_idx]
-                neg_traj = trajectories[neg_idx]
-                reason = "mixed"
+                neg_idx = correctness.index("No Answer") if "No Answer" in correctness else correctness.index(False) #first solve no answer
+                pos_traj = question_trajectories[pos_idx]["response"]
+                neg_traj = question_trajectories[neg_idx]["response"]
+                reason = "compare"
                 
                 # Track pair info
                 dpo_pair_info["positive_trajectory_id"] = f"{qid}_traj_{pos_idx}"
@@ -595,24 +390,23 @@ def train_dpo(
                 dpo_pair_info["negative_text"] = neg_traj
                 dpo_pair_info["pairing_reason"] = reason
                 
-                logger.debug(f"qid {qid}: Mixed results ({n_correct}/{n_total} correct) - using trajectory {pos_idx} as positive, {neg_idx} as negative")
             elif n_correct == 0:
                 # all wrong -> use reference_traj as positive if present, otherwise skip
                 if reference_traj and reference_traj.strip():
                     pos_traj = reference_traj
-                    neg_traj = trajectories[0] if trajectories else ""
-                    reason = "all_wrong_use_reference_pos"
+                    neg_idx = correctness.index("No Answer") if "No Answer" in correctness else correctness.index(False) #first solve no answer
+                    neg_traj = question_trajectories[neg_idx]["response"]
+                    reason = "use reference"
                     
                     # Track pair info
                     dpo_pair_info["positive_trajectory_id"] = f"{qid}_reference"
-                    dpo_pair_info["negative_trajectory_id"] = f"{qid}_traj_0" if trajectories else "none"
+                    dpo_pair_info["negative_trajectory_id"] = f"{qid}_traj_{neg_idx}"
                     dpo_pair_info["positive_source"] = "reference"
                     dpo_pair_info["negative_source"] = "generated_incorrect"
                     dpo_pair_info["positive_text"] = reference_traj
-                    dpo_pair_info["negative_text"] = trajectories[0] if trajectories else "none"
+                    dpo_pair_info["negative_text"] = neg_traj
                     dpo_pair_info["pairing_reason"] = reason
                     
-                    logger.debug(f"qid {qid}: All trajectories wrong ({n_correct}/{n_total}) - using reference as positive")
                 else:
                     logger.info(f"Skipping qid {qid}: all generated trajectories wrong and no reference trajectory available.")
                     continue
@@ -633,58 +427,23 @@ def train_dpo(
                     messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
                 )
                 
-                # Use the specified device for all computations to ensure consistency
-                logger.debug(f"Using device: {device_t}")
                 
                 # Compute masked log-probs for pos and neg continuations
                 logp_pos, pos_length = compute_masked_logprob(model, tokenizer, initial_sequence, pos_traj, device_t, return_length=True)
                 logp_neg, neg_length = compute_masked_logprob(model, tokenizer, initial_sequence, neg_traj, device_t, return_length=True)
                 
-                # Normalize by sequence length to prevent bias towards longer sequences
-                logger.debug(f"Before normalization: logp_pos={logp_pos.item():.6f} (length={pos_length}), logp_neg={logp_neg.item():.6f} (length={neg_length})")
-                if pos_length > 0:
-                    logp_pos = logp_pos / pos_length
-                if neg_length > 0:
-                    logp_neg = logp_neg / neg_length
-                logger.debug(f"After normalization: logp_pos={logp_pos.item():.6f}, logp_neg={logp_neg.item():.6f}")
+                # Move tensors to device
+                logp_pos = logp_pos.to(device_t)
+                logp_neg = logp_neg.to(device_t)
                 
-                # Ensure both log probabilities are on the same device
-                logp_pos = ensure_tensor_on_device(logp_pos, device_t)
-                logp_neg = ensure_tensor_on_device(logp_neg, device_t)
+                # Per-token DPO loss: average log probabilities to handle length differences
+                avg_logp_pos = logp_pos / pos_length if pos_length > 0 else logp_pos
+                avg_logp_neg = logp_neg / neg_length if neg_length > 0 else logp_neg
                 
-                # Additional safety check: verify tensors are on the same device
-                if logp_pos.device != logp_neg.device:
-                    logger.error(f"Device mismatch detected: logp_pos on {logp_pos.device}, logp_neg on {logp_neg.device}")
-                    # Force both to the specified device
-                    logp_pos = ensure_tensor_on_device(logp_pos, device_t)
-                    logp_neg = ensure_tensor_on_device(logp_neg, device_t)
-                
-                # DPO loss: stable form (softplus)
-                diff = (logp_pos - logp_neg) / (tau if tau > 0 else 1.0)
+                # DPO loss: stable form (softplus) on per-token basis
+                diff = (avg_logp_pos - avg_logp_neg) / (tau if tau > 0 else 1.0)
                 loss = F.softplus(-diff)  # equals -log sigmoid(diff) in a stable way
-                
-                # Additional debugging for numerical issues
-                if abs(diff.item()) < 1e-10:
-                    logger.warning(f"Extremely small difference between log probabilities: {diff.item():.12e}")
-                
-                # Test softplus behavior for debugging
-                if abs(diff.item()) < 1e-6:
-                    expected_loss = F.softplus(torch.tensor(0.0, device=device_t))
-                    logger.warning(f"Expected loss for diff=0: {expected_loss.item():.8f}, actual loss: {loss.item():.8f}")
-                
-                # Debug logging for zero loss cases
-                if loss.item() < 1e-4:  # Very small loss (less than 0.0001)
-                    logger.warning(f"Very small loss detected: {loss.item():.8f} | logp_pos: {logp_pos.item():.6f} | logp_neg: {logp_neg.item():.6f} | diff: {diff.item():.6f} | reason: {reason}")
-                    logger.warning(f"Positive trajectory length: {len(pos_traj)} chars, Negative trajectory length: {len(neg_traj)} chars")
-                    logger.warning(f"Positive trajectory preview: {pos_traj[:200]}...")
-                    logger.warning(f"Negative trajectory preview: {neg_traj[:200]}...")
-                    
-                    # Check if both are exactly zero (completely masked)
-                    if logp_pos.item() == 0.0 and logp_neg.item() == 0.0:
-                        logger.error("Both trajectories have zero log probability - likely completely masked out!")
-                
-                # Ensure loss is on the correct device
-                loss = ensure_tensor_on_device(loss, device_t)
+
                 
                 # Step 3: Backpropagate and update model immediately (on-policy)
                 optimizer.zero_grad()
@@ -693,18 +452,18 @@ def train_dpo(
                 
                 global_step += 1
                 
-                # Update progress bar with current loss
+                # Update progress bar with current loss and additional info
                 question_pbar.set_postfix({
                     'qid': qid[:20] + '...' if len(qid) > 20 else qid,
                     'loss': f"{loss.item():.4f}",
                     'reason': reason[:15] + '...' if len(str(reason)) > 15 else str(reason),
-                    'step': global_step
+                    'step': global_step,
+                    'pos_len': pos_length,
+                    'neg_len': neg_length
                 })
                 
                 if global_step % 10 == 0:
                     logger.info(f"Step {global_step} | qid {qid} | loss {loss.item():.4f} | reason {reason}")
-                else:
-                    logger.debug(f"qid {qid} | loss {loss.item():.4f} | reason {reason}")
                 
                 # Periodic save
                 if global_step % save_every_steps == 0:
@@ -719,19 +478,18 @@ def train_dpo(
                         logger.warning(f"Failed to save checkpoint at step {global_step}: {e}")
                 
                 # Clear GPU cache periodically to manage memory
-                if global_step % 50 == 0 and torch.cuda.is_available():
+                if global_step % 10 == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    logger.debug("GPU cache cleared")
             
             except Exception as e:
                 logger.error(f"Error computing DPO loss for qid {qid}: {e}")
-                # Log additional debugging information for device-related errors
-                if "device" in str(e).lower() or "cuda" in str(e).lower():
-                    logger.error(f"Device-related error detected. Model device: {get_model_device(model)}")
-                    logger.error(f"Available CUDA devices: {torch.cuda.device_count()}")
-                    if torch.cuda.is_available():
-                        for i in range(torch.cuda.device_count()):
-                            logger.error(f"CUDA device {i}: {torch.cuda.get_device_name(i)}")
+                # Log additional debugging information
+                logger.error(f"  - pos_traj length: {len(pos_traj) if pos_traj else 'None'}")
+                logger.error(f"  - neg_traj length: {len(neg_traj) if neg_traj else 'None'}")
+                logger.error(f"  - reason: {reason}")
+                logger.error(f"  - device: {device_t}")
+                import traceback
+                logger.error(f"  - traceback: {traceback.format_exc()}")
                 continue
         
         logger.info(f"Epoch {epoch+1} completed! Total steps: {global_step}")
