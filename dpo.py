@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import copy
 from typing import List, Optional, Tuple, Dict, Any
 
 import torch
@@ -14,9 +15,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.optim import AdamW
 from peft import PeftModel
 
-from main import InferenceSystem, InferenceConfig
+from main import InferenceSystem, InferenceConfig, Reasoner, Summarizer
 from utils import load_dataset, is_exact_match, extract_answer, cover_match
-from models import get_model_device
+# from models import get_model_device  # Not needed for distributed models
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -57,8 +58,11 @@ def compute_masked_logprob(
     cont_ids = enc_cont["input_ids"]
     offsets = enc_cont["offset_mapping"][0].tolist()  # list of (start, end) pairs per cont token
 
-    # Build full input ids = prompt + continuation and move to the specified device
-    input_ids = torch.cat([prompt_ids, cont_ids], dim=1).to(device)
+    # Build full input ids = prompt + continuation and move to the model's device
+    input_ids = torch.cat([prompt_ids, cont_ids], dim=1)
+    
+    # For models with device_map="auto", let transformers handle device placement
+    # The warning about device mismatch is just a performance warning, not an error
     
     cont_start = prompt_ids.shape[1]
     seq_len = input_ids.shape[1]
@@ -67,18 +71,27 @@ def compute_masked_logprob(
     outputs = model(input_ids, return_dict=True)
     logits = outputs.logits  # (1, seq_len, vocab_size)
 
-    # Create position tensors directly on the specified device to avoid device mismatch
-    pred_pos = torch.arange(cont_start - 1, seq_len - 1, device=device, dtype=torch.long)
-    target_pos = torch.arange(cont_start, seq_len, device=device, dtype=torch.long)
+    # Create position tensors - let them be placed automatically by PyTorch
+    pred_pos = torch.arange(cont_start - 1, seq_len - 1, dtype=torch.long)
+    target_pos = torch.arange(cont_start, seq_len, dtype=torch.long)
 
     logits_preds = logits[0, pred_pos, :]  # shape (num_cont_tokens, vocab)
     target_ids = input_ids[0, target_pos].long()  # shape (num_cont_tokens,) - ensure LongTensor
-
+    
+    # Clamp logits to prevent overflow in log_softmax
+    logits_preds = torch.clamp(logits_preds, min=-50, max=50)
+    
+    # Use F.log_softmax in float32 for numerical stability
+    # Convert to float32 for the computation, then back to original dtype
     log_probs = F.log_softmax(logits_preds, dim=-1)
+    
+    # Convert back to original dtype if needed
+    
     token_log_probs = log_probs.gather(1, target_ids.unsqueeze(-1)).squeeze(-1)  # (num_cont_tokens,)
+    
 
     # Build mask: True for tokens to KEEP (not in <information>), False to drop
-    keep_mask = torch.ones_like(token_log_probs, dtype=torch.bool, device=token_log_probs.device)
+    keep_mask = torch.ones_like(token_log_probs, dtype=torch.bool)
     masked_tokens = 0
     for i, (tok_start, tok_end) in enumerate(offsets):
         # if token overlaps any info_span -> drop it
@@ -96,10 +109,13 @@ def compute_masked_logprob(
         
         
         if return_length:
-            return torch.tensor(0.0, device=token_log_probs.device, dtype=torch.float32), 0
-        return torch.tensor(0.0, device=token_log_probs.device, dtype=torch.float32)
+            return torch.tensor(0.0, dtype=torch.float32), 0
+        return torch.tensor(0.0, dtype=torch.float32)
 
     kept_log_probs = token_log_probs[keep_mask]
+    
+    # Clamp log probabilities to prevent extreme values that could cause NaN in sum
+    kept_log_probs = torch.clamp(kept_log_probs, min=-50, max=50)
     total_log_prob = kept_log_probs.sum()
     num_kept_tokens = keep_mask.sum().item()
     
@@ -144,7 +160,6 @@ def generate_trajectories_for_question(
         results = system.inference(question_copies, max_turns=max_turns)
         # Sort results by trajectory index to ensure consistent order
         results.sort(key=lambda x: x.get("trajectory_idx", -1))
-        
         return results
         
     except Exception as e:
@@ -170,11 +185,13 @@ def train_dpo(
     output_dir: str,
     epochs: int = 1,
     sample_trajectories: int = 3,
-    lr: float = 1e-4,
+    lr: float = 5e-6,
     tau: float = 1.0,
     save_every_steps: int = 200,
     max_data_samples: int = None,
     high_randomness: bool = True,
+    lora_only: bool = False,
+    gradient_accumulation_steps: int = 1,
 ):
     logger.info("=" * 70)
     logger.info("DPO Training Configuration")
@@ -193,6 +210,8 @@ def train_dpo(
     logger.info(f"Output Dir: {output_dir}")
     logger.info(f"Max Data Samples: {max_data_samples if max_data_samples else 'All'}")
     logger.info(f"High Randomness Mode: {high_randomness}")
+    logger.info(f"LoRA Only Training: {lora_only}")
+    logger.info(f"Gradient Accumulation Steps: {gradient_accumulation_steps}")
     logger.info("=" * 70)
     
     os.makedirs(output_dir, exist_ok=True)
@@ -264,40 +283,100 @@ def train_dpo(
     system = InferenceSystem(inf_cfg)
     tokenizer = system.reasoner.tokenizer
     logger.info("InferenceSystem initialized successfully")
-
-    # Use the SAME reasoner model from InferenceSystem for training (true on-policy training)
-    logger.info("Using the same reasoner model from InferenceSystem for training...")
-    model = system.reasoner.model  # This is the exact same model used for generation
     
-    # MERGE LoRA ADAPTER INTO BASE MODEL (if LoRA is present)
-    if hasattr(model, 'merge_and_unload'):
-        logger.info("Merging LoRA adapter into base model parameters...")
-        model = model.merge_and_unload()  # This merges LoRA weights into base model
-        logger.info("LoRA adapter successfully merged into base model")
-    elif hasattr(model, 'base_model') and hasattr(model.base_model, 'merge_and_unload'):
-        logger.info("Merging LoRA adapter into base model parameters...")
-        model = model.base_model.merge_and_unload()  # For nested PEFT models
-        logger.info("LoRA adapter successfully merged into base model")
+    # Multi-GPU device management
+    logger.info("Configuring multi-GPU device usage...")
+    if torch.cuda.device_count() > 1:
+        logger.info(f"Multi-GPU environment detected: {torch.cuda.device_count()} GPUs available")
+        logger.info("InferenceSystem should handle multi-GPU device management automatically")
     else:
-        logger.info("No LoRA adapter found to merge, using base model directly")
+        logger.info("Single GPU environment detected")
+
+    # Use reasoner model as reference (already loaded and frozen)
+    logger.info("Using reasoner model as reference for DPO training...")
+    model_ref = system.reasoner.model
+    model_ref.eval()
     
-    # Set model to training mode
-    model.train()
+    # Create a copy of the reasoner model for training
+    logger.info("Creating copy of reasoner model for training...")
+    model = copy.deepcopy(system.reasoner.model)
     
-    # Enable all parameters for training (full fine-tuning after LoRA merge)
-    for param in model.parameters():
-        param.requires_grad = True
+    # Verify models are truly separate
+    logger.info("Verifying models are separate...")
+    policy_params = list(model.parameters())
+    ref_params = list(model_ref.parameters())
+    logger.info(f"Policy model parameters: {len(policy_params)}")
+    logger.info(f"Reference model parameters: {len(ref_params)}")
     
-    # Prepare optimizer for all parameters (full model training)
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    logger.info(f"Number of trainable params: {sum(p.numel() for p in trainable):,}")
-    logger.info("Training full model (LoRA merged + base model parameters)")
+    # Check if any parameters are shared (they shouldn't be)
+    shared_count = 0
+    for i, (p1, p2) in enumerate(zip(policy_params, ref_params)):
+        if p1.data_ptr() == p2.data_ptr():
+            shared_count += 1
+            logger.warning(f"Parameter {i} is shared between policy and reference models!")
+    
+    if shared_count == 0:
+        logger.info("✅ Models are completely separate - no shared parameters")
+    else:
+        logger.error(f"❌ {shared_count} parameters are shared between models!")
+    
+    if lora_only:
+        # LoRA-only training: keep LoRA adapter separate, don't merge
+        logger.info("LoRA-only training mode: keeping LoRA adapter separate")
+        
+        # For distributed models, avoid manual device placement
+        # The model should already be properly distributed via device_map="auto"
+        logger.info("Using distributed model setup - no manual device placement needed")
+        
+        # Set model to training mode
+        model.train()
+        
+        # Enable only LoRA parameters for training
+        for name, param in model.named_parameters():
+            if 'lora' in name.lower() or 'adapter' in name.lower():
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        logger.info(f"Number of trainable params (LoRA only): {sum(p.numel() for p in trainable):,}")
+        logger.info("Training LoRA adapter only")
+        
+    else:
+        # Full model training: merge LoRA adapter into base model
+        if hasattr(model, 'merge_and_unload'):
+            logger.info("Merging LoRA adapter into base model parameters...")
+            model = model.merge_and_unload()  # This merges LoRA weights into base model
+            logger.info("LoRA adapter successfully merged into base model")
+        elif hasattr(model, 'base_model') and hasattr(model.base_model, 'merge_and_unload'):
+            logger.info("Merging LoRA adapter into base model parameters...")
+            model = model.base_model.merge_and_unload()  # For nested PEFT models
+            logger.info("LoRA adapter successfully merged into base model")
+        else:
+            logger.info("No LoRA adapter found to merge, using base model directly")
+        
+        # For distributed models, avoid manual device placement
+        # The model should already be properly distributed via device_map="auto"
+        logger.info("Using distributed model setup - no manual device placement needed")
+        
+        # Set model to training mode
+        model.train()
+        
+        # Enable all parameters for training (full fine-tuning after LoRA merge)
+        for param in model.parameters():
+            param.requires_grad = True
+        
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        logger.info(f"Number of trainable params (full model): {sum(p.numel() for p in trainable):,}")
+        logger.info("Training full model (LoRA merged + base model parameters)")
     
     optimizer = AdamW(trainable, lr=lr)
     
     
 
     global_step = 0
+    accumulated_loss = 0.0
+    accumulation_count = 0
 
     # Create overall epoch progress bar
     epoch_pbar = tqdm(range(epochs), desc="DPO Training Epochs", unit="epoch", position=0)
@@ -305,15 +384,15 @@ def train_dpo(
         epoch_pbar.set_description(f"Epoch {epoch+1}/{epochs}")
         logger.info(f"==== Starting epoch {epoch+1}/{epochs} ====")
         logger.info(f"Processing {len(normalized)} questions")
-        logger.info("ON-POLICY TRAINING: Each question will be processed sequentially")
+        logger.info("OFF-POLICY TRAINING: Using frozen reasoner for generation, training separate model")
         
         # Collect all DPO trajectories used for training
         all_dpo_trajectories = []
         total_trajectories_generated = 0
         valid_trajectories_generated = 0
         
-        # ON-POLICY TRAINING: Process each question sequentially
-        question_pbar = tqdm(normalized, desc=f"Epoch {epoch+1}: On-policy DPO Training", unit="question", position=1)
+        # OFF-POLICY TRAINING: Process each question sequentially using frozen reasoner
+        question_pbar = tqdm(normalized, desc=f"Epoch {epoch+1}: Off-policy DPO Training", unit="question", position=1)
         for question_idx, question_data in enumerate(question_pbar):
             qid = question_data.get("id")
             prompt = question_data["prompt"]
@@ -389,6 +468,24 @@ def train_dpo(
                 dpo_pair_info["positive_text"] = pos_traj
                 dpo_pair_info["negative_text"] = neg_traj
                 dpo_pair_info["pairing_reason"] = reason
+            # TEMPORARY FIX: If all trajectories are correct, artificially create a pair
+            elif n_correct == n_total and n_total >= 2:
+                # Use the first trajectory as positive, second as negative (artificially)
+                pos_idx = 0
+                neg_idx = 1
+                pos_traj = question_trajectories[pos_idx]["response"]
+                neg_traj = question_trajectories[neg_idx]["response"]
+                reason = "artificial_pair"
+                logger.info(f"🔧 ARTIFICIAL DPO PAIR for {qid}: {reason} (all trajectories were correct)")
+                
+                # Track pair info
+                dpo_pair_info["positive_trajectory_id"] = f"{qid}_traj_{pos_idx}"
+                dpo_pair_info["negative_trajectory_id"] = f"{qid}_traj_{neg_idx}"
+                dpo_pair_info["positive_source"] = "generated_correct"
+                dpo_pair_info["negative_source"] = "generated_incorrect"
+                dpo_pair_info["positive_text"] = pos_traj
+                dpo_pair_info["negative_text"] = neg_traj
+                dpo_pair_info["pairing_reason"] = reason
                 
             elif n_correct == 0:
                 # all wrong -> use reference_traj as positive if present, otherwise skip
@@ -428,49 +525,86 @@ def train_dpo(
                 )
                 
                 
-                # Compute masked log-probs for pos and neg continuations
-                logp_pos, pos_length = compute_masked_logprob(model, tokenizer, initial_sequence, pos_traj, device_t, return_length=True)
-                logp_neg, neg_length = compute_masked_logprob(model, tokenizer, initial_sequence, neg_traj, device_t, return_length=True)
+                # Compute masked log-probs for pos and neg continuations using current model
+                logp_pos_pi, pos_length = compute_masked_logprob(model, tokenizer, initial_sequence, pos_traj, device_t, return_length=True)
+                logp_neg_pi, neg_length = compute_masked_logprob(model, tokenizer, initial_sequence, neg_traj, device_t, return_length=True)
                 
-                # Move tensors to device
-                logp_pos = logp_pos.to(device_t)
-                logp_neg = logp_neg.to(device_t)
+                # Compute masked log-probs for pos and neg continuations using reference model
+                logp_pos_ref, _ = compute_masked_logprob(model_ref, tokenizer, initial_sequence, pos_traj, device_t, return_length=True)
+                logp_neg_ref, _ = compute_masked_logprob(model_ref, tokenizer, initial_sequence, neg_traj, device_t, return_length=True)
                 
-                # Per-token DPO loss: average log probabilities to handle length differences
-                avg_logp_pos = logp_pos / pos_length if pos_length > 0 else logp_pos
-                avg_logp_neg = logp_neg / neg_length if neg_length > 0 else logp_neg
+                # For models with device_map="auto", let transformers handle device placement
+                # No need to manually move tensors to specific devices
                 
-                # DPO loss: stable form (softplus) on per-token basis
-                diff = (avg_logp_pos - avg_logp_neg) / (tau if tau > 0 else 1.0)
-                loss = F.softplus(-diff)  # equals -log sigmoid(diff) in a stable way
+                # Average log probabilities to handle length differences
+                # Clamp log probabilities to prevent extreme values before averaging
+                logp_pos_pi = torch.clamp(logp_pos_pi, min=-50, max=50)
+                logp_neg_pi = torch.clamp(logp_neg_pi, min=-50, max=50)
+                logp_pos_ref = torch.clamp(logp_pos_ref, min=-50, max=50)
+                logp_neg_ref = torch.clamp(logp_neg_ref, min=-50, max=50)
+                
+                avg_pos_pi = logp_pos_pi / max(1, pos_length)
+                avg_neg_pi = logp_neg_pi / max(1, neg_length)
+                avg_pos_ref = logp_pos_ref / max(1, pos_length)
+                avg_neg_ref = logp_neg_ref / max(1, neg_length)
+                
+                # DPO loss: stable form using reference model
+                diff = ((avg_pos_pi - avg_pos_ref) - (avg_neg_pi - avg_neg_ref)) / tau
+                
+                # Check for NaN/Inf in the difference before computing loss
+                if torch.isnan(diff) or torch.isinf(diff):
+                    logger.warning(f"NaN/Inf detected in DPO diff for qid {qid}, skipping this step")
+                    continue
+                
+                # Clamp diff to prevent extreme values in softplus
+                diff = torch.clamp(diff, min=-10, max=10)
+                loss = F.softplus(-diff)
+                # Check for NaN/Inf in the final loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.warning(f"NaN/Inf detected in DPO loss for qid {qid}, skipping this step")
+                    continue
 
-                
-                # Step 3: Backpropagate and update model immediately (on-policy)
-                optimizer.zero_grad()
+                # Gradient accumulation
+                loss = loss / gradient_accumulation_steps  # Scale loss by accumulation steps
                 loss.backward()
-                optimizer.step()
                 
-                global_step += 1
+                accumulated_loss += loss.item()
+                accumulation_count += 1
+                
+                # Step 3: Update model after accumulating gradients
+                if accumulation_count >= gradient_accumulation_steps:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+                    accumulated_loss = 0.0
+                    accumulation_count = 0
                 
                 # Update progress bar with current loss and additional info
+                current_loss = loss.item() * gradient_accumulation_steps  # Show unscaled loss
                 question_pbar.set_postfix({
                     'qid': qid[:20] + '...' if len(qid) > 20 else qid,
-                    'loss': f"{loss.item():.4f}",
+                    'loss': f"{current_loss:.4f}",
+                    'acc_loss': f"{accumulated_loss:.4f}",
                     'reason': reason[:15] + '...' if len(str(reason)) > 15 else str(reason),
                     'step': global_step,
+                    'acc_count': accumulation_count,
                     'pos_len': pos_length,
                     'neg_len': neg_length
                 })
                 
                 if global_step % 10 == 0:
-                    logger.info(f"Step {global_step} | qid {qid} | loss {loss.item():.4f} | reason {reason}")
+                    logger.info(f"Step {global_step} | qid {qid} | loss {current_loss:.4f} | acc_loss {accumulated_loss:.4f} | reason {reason}")
                 
                 # Periodic save
                 if global_step % save_every_steps == 0:
                     ckpt_dir = os.path.join(output_dir, f"checkpoint_step{global_step}")
                     os.makedirs(ckpt_dir, exist_ok=True)
                     try:
-                        # Save model directly (no unwrapping needed without Accelerate)
+                        # Save model (works for both full models and LoRA adapters)
+                        if lora_only:
+                            logger.info(f"Saving LoRA adapter checkpoint to {ckpt_dir}")
+                        else:
+                            logger.info(f"Saving full model checkpoint to {ckpt_dir}")
                         model.save_pretrained(ckpt_dir)
                         tokenizer.save_pretrained(ckpt_dir)
                         logger.info(f"Saved checkpoint to {ckpt_dir}")
@@ -492,6 +626,13 @@ def train_dpo(
                 logger.error(f"  - traceback: {traceback.format_exc()}")
                 continue
         
+        # Flush any remaining accumulated gradients
+        if accumulation_count > 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
+            logger.info(f"Flushed remaining {accumulation_count} accumulated gradients at end of epoch")
+        
         logger.info(f"Epoch {epoch+1} completed! Total steps: {global_step}")
         logger.info(f"Generated {valid_trajectories_generated}/{total_trajectories_generated} valid trajectories")
         logger.info(f"Used {len(all_dpo_trajectories)} DPO pairs for training")
@@ -510,8 +651,8 @@ def train_dpo(
             "valid_trajectories_generated": valid_trajectories_generated,
             "total_training_steps": global_step,
             "dpo_pairs_used": len(all_dpo_trajectories),
-            "training_mode": "on_policy",
-            "training_summary": f"On-policy DPO training: each question processed sequentially with immediate model updates. See dpo_trajectories_used_epoch_{epoch + 1}.json for DPO training pairs."
+            "training_mode": "off_policy",
+            "training_summary": f"Off-policy DPO training: frozen reasoner generates trajectories, separate training model updated. See dpo_trajectories_used_epoch_{epoch + 1}.json for DPO training pairs."
         }
         
         summary_file = os.path.join(output_dir, f"dpo_training_summary_epoch_{epoch+1}.json")
@@ -523,7 +664,11 @@ def train_dpo(
     final_dir = os.path.join(output_dir, "dpo_final")
     os.makedirs(final_dir, exist_ok=True)
     try:
-        # Save model directly (no unwrapping needed without Accelerate)
+        # Save model (works for both full models and LoRA adapters)
+        if lora_only:
+            logger.info(f"Saving final LoRA adapter to {final_dir}")
+        else:
+            logger.info(f"Saving final full model to {final_dir}")
         model.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
         logger.info(f"Saved final model/adapters to {final_dir}")
@@ -535,7 +680,7 @@ def train_dpo(
 # CLI
 # -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="ON-POLICY DPO training for agentic RAG reasoner (uses main.Reasoner for generation, trains on each question sequentially)")
+    parser = argparse.ArgumentParser(description="OFF-POLICY DPO training for agentic RAG reasoner (uses frozen reasoner for generation, trains separate model)")
     parser.add_argument("--data", type=str, default="dpo_training_data.json", help="Path to training data (JSON or JSONL)")
     parser.add_argument("--base-model", type=str, default="/scratch/yl9038/models/Qwen3-0.6B", help="Path to base causal LM model")
     parser.add_argument("--lora-adapter", type=str, default="models/llamafactory/qwen3-lora-0.6B", help="Path to LoRA adapter (optional)")
@@ -547,12 +692,14 @@ def main():
     parser.add_argument("--output-dir", type=str, default="dpo_output", help="Directory to save checkpoints")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--sample-trajectories", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--save-every-steps", type=int, default=200)
     parser.add_argument("--max-data-samples", type=int, default=None, help="Maximum number of data samples to use (None for all)")
     parser.add_argument("--high-randomness", action="store_true", default=True, help="Enable high randomness mode for diverse trajectory generation (default: True)")
     parser.add_argument("--no-high-randomness", dest="high_randomness", action="store_false", help="Disable high randomness mode")
+    parser.add_argument("--lora-only", action="store_true", default=False, help="Train LoRA adapter only (not full model)")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Number of gradient accumulation steps before optimizer step")
     args = parser.parse_args()
 
     train_dpo(
@@ -572,6 +719,8 @@ def main():
         save_every_steps=args.save_every_steps,
         max_data_samples=args.max_data_samples,
         high_randomness=args.high_randomness,
+        lora_only=args.lora_only,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
 

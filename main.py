@@ -32,6 +32,34 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def get_model_device(model):
+    """
+    Get the appropriate device for a model, handling both single-device and distributed models.
+    
+    Args:
+        model: The model to get device for
+        
+    Returns:
+        torch.device: The device to use for tensors
+    """
+    if hasattr(model, 'device') and model.device.type != 'cpu':
+        # Single device model
+        return model.device
+    else:
+        # For distributed models, we need to be more careful
+        # Try to find the device of the input embedding layer first
+        if hasattr(model, 'get_input_embeddings'):
+            try:
+                embedding_device = next(model.get_input_embeddings().parameters()).device
+                if embedding_device.type != 'cpu':
+                    return embedding_device
+            except:
+                pass
+        
+        # Fallback to the device of the first parameter
+        return next(model.parameters()).device
+
+
 class StopOnStringCriteria(StoppingCriteria):
     def __init__(self, tokenizer, stop_strings, initial_length):
         self.tokenizer = tokenizer
@@ -92,9 +120,11 @@ class Reasoner:
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype="auto",
+            torch_dtype="float32",
             device_map="auto"
         )
+        
+        # With device_map="auto", transformers handles device placement automatically
         
         # Load LoRA adapters if specified
         if self.config.reasoner_lora_path:
@@ -126,7 +156,11 @@ class Reasoner:
         """
         
         # Tokenize input
-        model_inputs = self.tokenizer([sequence], return_tensors="pt").to(self.model.device)
+        model_inputs = self.tokenizer([sequence], return_tensors="pt")
+        
+        # For models with device_map="auto", let transformers handle device placement
+        # The warning about device mismatch is just a performance warning, not an error
+        
         initial_length = model_inputs['input_ids'].shape[1]
         
         # Create stopping criteria for </search> and </answer> tags
@@ -202,9 +236,11 @@ class Summarizer:
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype="auto",
+            torch_dtype="float32",
             device_map="auto"
         )
+        
+        # With device_map="auto", transformers handles device placement automatically
         
         # Load LoRA adapters if specified
         if self.config.summarizer_lora_path:
@@ -249,7 +285,11 @@ class Summarizer:
         )
         
         # Tokenize input
-        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        model_inputs = self.tokenizer([text], return_tensors="pt")
+        
+        # For models with device_map="auto", let transformers handle device placement
+        # The warning about device mismatch is just a performance warning, not an error
+        
         input_length = model_inputs["input_ids"].shape[1]
         
         # Generate summary
@@ -387,7 +427,10 @@ class InferenceSystem:
             # Extract hidden states from the reasoner model
             input_text = f"<search> {question} </search>"
             inputs = self.reasoner.tokenizer(input_text, return_tensors="pt")
-            input_ids = inputs["input_ids"].to(self.reasoner.model.device)
+            
+            # For models with device_map="auto", let transformers handle device placement
+            # The warning about device mismatch is just a performance warning, not an error
+            input_ids = inputs["input_ids"]
             
             with torch.no_grad():
                 outputs = self.reasoner.model(input_ids, output_hidden_states=True)
