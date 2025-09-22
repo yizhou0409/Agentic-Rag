@@ -77,12 +77,12 @@ def compute_masked_logprob(
     logits_preds = logits[0, pred_pos, :]  # shape (num_cont_tokens, vocab)
     target_ids = input_ids[0, target_pos].long()  # shape (num_cont_tokens,) - ensure LongTensor
     
-    # Clamp logits to prevent overflow in log_softmax
-    logits_preds = torch.clamp(logits_preds, min=-50, max=50)
+    # Clamp extreme logits to prevent softmax saturation and overconfidence
+    logits_preds_clamped = torch.clamp(logits_preds, min=-30.0, max=30.0)
     
     # Use F.log_softmax in float32 for numerical stability
     # Convert to float32 for the computation, then back to original dtype
-    log_probs = F.log_softmax(logits_preds, dim=-1)
+    log_probs = F.log_softmax(logits_preds_clamped, dim=-1)
     
     # Convert back to original dtype if needed
     
@@ -113,10 +113,9 @@ def compute_masked_logprob(
 
     kept_log_probs = token_log_probs[keep_mask]
     
-    # Clamp log probabilities to prevent extreme values that could cause NaN in sum
-    kept_log_probs = torch.clamp(kept_log_probs, min=-50, max=50)
     total_log_prob = kept_log_probs.sum()
     num_kept_tokens = keep_mask.sum().item()
+    
     
     if return_length:
         return total_log_prob, num_kept_tokens
@@ -467,25 +466,6 @@ def train_dpo(
                 dpo_pair_info["positive_text"] = pos_traj
                 dpo_pair_info["negative_text"] = neg_traj
                 dpo_pair_info["pairing_reason"] = reason
-            # TEMPORARY FIX: If all trajectories are correct, artificially create a pair
-            elif n_correct == n_total and n_total >= 2:
-                # Use the first trajectory as positive, second as negative (artificially)
-                pos_idx = 0
-                neg_idx = 1
-                pos_traj = question_trajectories[pos_idx]["response"]
-                neg_traj = question_trajectories[neg_idx]["response"]
-                reason = "artificial_pair"
-                logger.info(f"🔧 ARTIFICIAL DPO PAIR for {qid}: {reason} (all trajectories were correct)")
-                
-                # Track pair info
-                dpo_pair_info["positive_trajectory_id"] = f"{qid}_traj_{pos_idx}"
-                dpo_pair_info["negative_trajectory_id"] = f"{qid}_traj_{neg_idx}"
-                dpo_pair_info["positive_source"] = "generated_correct"
-                dpo_pair_info["negative_source"] = "generated_incorrect"
-                dpo_pair_info["positive_text"] = pos_traj
-                dpo_pair_info["negative_text"] = neg_traj
-                dpo_pair_info["pairing_reason"] = reason
-                
             elif n_correct == 0:
                 # all wrong -> use reference_traj as positive if present, otherwise skip
                 if reference_traj and reference_traj.strip():
@@ -507,7 +487,7 @@ def train_dpo(
                     logger.info(f"Skipping qid {qid}: all generated trajectories wrong and no reference trajectory available.")
                     continue
             else:
-                # all correct => skip
+                # all correct => skip (no artificial pairs)
                 logger.info(f"Skipping qid {qid}: all {n_total} trajectories correct.")
                 continue
             
@@ -535,36 +515,39 @@ def train_dpo(
                 # For models with device_map="auto", let transformers handle device placement
                 # No need to manually move tensors to specific devices
                 
-                # Average log probabilities to handle length differences
-                # Clamp log probabilities to prevent extreme values before averaging
-                logp_pos_pi = torch.clamp(logp_pos_pi, min=-50, max=50)
-                logp_neg_pi = torch.clamp(logp_neg_pi, min=-50, max=50)
-                logp_pos_ref = torch.clamp(logp_pos_ref, min=-50, max=50)
-                logp_neg_ref = torch.clamp(logp_neg_ref, min=-50, max=50)
                 
                 avg_pos_pi = logp_pos_pi / max(1, pos_length)
                 avg_neg_pi = logp_neg_pi / max(1, neg_length)
                 avg_pos_ref = logp_pos_ref / max(1, pos_length)
                 avg_neg_ref = logp_neg_ref / max(1, neg_length)
+
+                print(f"avg_pos_pi: {avg_pos_pi}, avg_neg_pi: {avg_neg_pi}, avg_pos_ref: {avg_pos_ref}, avg_neg_ref: {avg_neg_ref}")
+                
                 
                 # DPO loss: stable form using reference model
                 diff = ((avg_pos_pi - avg_pos_ref) - (avg_neg_pi - avg_neg_ref)) / tau
                 
-                # Check for NaN/Inf in the difference before computing loss
-                if torch.isnan(diff) or torch.isinf(diff):
-                    logger.warning(f"NaN/Inf detected in DPO diff for qid {qid}, skipping this step")
-                    continue
+
+                if diff==0:
+                    print(f"WARNING: Diff is 0 for qid {qid}, different trajectories: {pos_traj==neg_traj}, logprobs: {logp_pos_pi}, {logp_neg_pi} ref: {logp_pos_ref}, {logp_neg_ref}")
                 
-                # Clamp diff to prevent extreme values in softplus
-                diff = torch.clamp(diff, min=-10, max=10)
-                loss = F.softplus(-diff)
-                # Check for NaN/Inf in the final loss
-                if torch.isnan(loss) or torch.isinf(loss):
-                    logger.warning(f"NaN/Inf detected in DPO loss for qid {qid}, skipping this step")
-                    continue
+                # No safety checks - allow all values through
+                
+                # Standard DPO loss
+                dpo_loss = F.softplus(-diff)
+                
+                # Add regularization to encourage policy to assign higher probability to positive samples
+                # This helps the policy learn genuine preferences
+                positive_encouragement = F.relu(avg_pos_ref - avg_pos_pi) * 0.3  # Encourage policy to match or exceed reference on positive
+                
+                total_loss = dpo_loss + positive_encouragement
+                
+                print(f"dpo_loss: {dpo_loss:.4f}, pos_encouragement: {positive_encouragement:.4f}, total_loss: {total_loss:.4f}")
+                
+                # No safety checks on final loss - allow all values through
 
                 # Gradient accumulation
-                loss = loss / gradient_accumulation_steps  # Scale loss by accumulation steps
+                loss = total_loss / gradient_accumulation_steps  # Scale loss by accumulation steps
                 loss.backward()
                 
                 accumulated_loss += loss.item()
@@ -572,6 +555,9 @@ def train_dpo(
                 
                 # Step 3: Update model after accumulating gradients
                 if accumulation_count >= gradient_accumulation_steps:
+                    # Clip gradients to prevent extreme updates
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
@@ -627,6 +613,9 @@ def train_dpo(
         
         # Flush any remaining accumulated gradients
         if accumulation_count > 0:
+            # Clip gradients to prevent extreme updates
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             optimizer.zero_grad()
             global_step += 1

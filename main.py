@@ -92,7 +92,6 @@ class Reasoner:
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype="float32",
             device_map="auto"
         )
         
@@ -155,16 +154,16 @@ class Reasoner:
                     stopping_criteria=stopping_criteria
                 )
             elif self.config.high_randomness_mode:
-                # Use more aggressive random settings for diverse trajectory generation (DPO training)
+                # Use very aggressive random settings for diverse trajectory generation (DPO training)
                 logger.debug("Using high randomness mode for diverse trajectory generation")
                 generated_ids = self.model.generate(
                     **model_inputs,
                     max_new_tokens=self.config.max_new_tokens,
-                    temperature=1.2,  # Higher temperature for more randomness
-                    top_p=0.9,        # Higher top_p for more diversity
-                    top_k=40,         # Higher top_k for more token options
-                    min_p=0.05,       # Minimum probability threshold
-                    repetition_penalty=1.1,  # Slight repetition penalty to avoid loops
+                    temperature=1.5,  # Very high temperature for maximum randomness
+                    top_p=0.95,       # Very high top_p for maximum diversity
+                    top_k=60,         # Very high top_k for maximum token options
+                    min_p=0.02,       # Lower minimum probability threshold for more exploration
+                    repetition_penalty=1.15,  # Higher repetition penalty to avoid loops
                     do_sample=True,
                     pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
@@ -208,7 +207,6 @@ class Summarizer:
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype="float32",
             device_map="auto"
         )
         
@@ -443,13 +441,12 @@ class InferenceSystem:
         match = re.search(answer_pattern, text, re.DOTALL)
         return match.group(1).strip() if match else None
     
-    def inference_one_turn(self, active_questions: List[Dict[str, Any]], turn_pbar: Optional[tqdm] = None) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    def inference_one_turn(self, active_questions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         """
         Perform one turn of inference for all active questions.
         
         Args:
             active_questions: List of question data with current sequences
-            turn_pbar: Optional progress bar for turn-level progress
             
         Returns:
             Tuple of (updated_active_questions, search_queries_dict)
@@ -460,8 +457,6 @@ class InferenceSystem:
         question_pbar = tqdm(active_questions, desc="Processing questions", unit="question", position=2, leave=False)
         
         for question_data in question_pbar:
-            # Update progress bar to show current question
-            question_pbar.set_description(f"Processing question {question_data['id']}")
             
             # Generate response using the current sequence
             response = self.reasoner.generate_response(question_data["sequence"])
@@ -521,8 +516,6 @@ class InferenceSystem:
         # Process each unique query
         for query in query_pbar:
             try:
-                # Update progress bar to show current query
-                query_pbar.set_description(f"Processing query: {query[:30]}...")
                 
                 # Check probe confidence if probe is enabled
                 should_retrieve = True
@@ -682,17 +675,13 @@ class InferenceSystem:
         completed_questions = []
         
         # Process questions in turns with progress tracking
-        turn_pbar = tqdm(range(max_turns + 1), desc="Inference turns", unit="turn", position=1, leave=False) if progress_bar else range(max_turns + 1)
-        for turn_num in turn_pbar:
+        for turn_num in range(max_turns + 1):
             if not active_questions:
                 break
             
-            # Update turn progress bar description
-            if progress_bar and hasattr(turn_pbar, 'set_description'):
-                turn_pbar.set_description(f"Turn {turn_num + 1}/{max_turns + 1} (Active: {len(active_questions)})")
             
             # Step 1: Generate responses for all active questions
-            active_questions, search_queries = self.inference_one_turn(active_questions, turn_pbar)
+            active_questions, search_queries = self.inference_one_turn(active_questions)
             
             # Update probe counters for search queries
             if probe_counters is not None and search_queries:
@@ -711,20 +700,14 @@ class InferenceSystem:
                     question_data["final_turn"] = turn_num + 1
                     logger.info(f"Question {question_data['id']} completed in turn {turn_num + 1}")
                     new_completed.append(question_data)
-                    # Update progress bar with question ID
-                    if progress_bar:
-                        progress_bar.set_description(f"Completed question {question_data['id']}")
-                        progress_bar.update(1)
+
                 elif not search_query:
                     # No search query or answer found
                     question_data["error"] = "No search query or answer found"
                     question_data["final_turn"] = turn_num + 1
                     logger.info(f"Question {question_data['id']} completed with error: No search query or answer found")
                     new_completed.append(question_data)
-                    # Update progress bar with question ID
-                    if progress_bar:
-                        progress_bar.set_description(f"Completed question {question_data['id']} (error)")
-                        progress_bar.update(1)
+
             
             # Add completed questions to results
             completed_questions.extend(new_completed)
@@ -746,10 +729,6 @@ class InferenceSystem:
                     question_data["final_turn"] = max_turns
                     logger.info(f"Question {question_data['id']} completed with error: Max turns reached")
                     completed_questions.append(question_data)
-                    # Update progress bar with question ID
-                    if progress_bar:
-                        progress_bar.set_description(f"Completed question {question_data['id']} (max turns)")
-                        progress_bar.update(1)
                 active_questions = []
         
         # Calculate metrics for all results
