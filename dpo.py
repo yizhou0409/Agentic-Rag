@@ -31,18 +31,36 @@ def compute_masked_logprob(
     continuation: str,
     device: torch.device,
     return_length: bool = False,
+    answer_weight: float = 2.5,
+    search_weight: float = 2.5,
+    information_weight: float = 0.0,
 ) -> torch.Tensor:
     """
-    Compute sum of log-probs of continuation tokens conditioned on prompt,
-    excluding tokens whose character spans in `continuation` overlap any <information>...</information> spans.
-    Returns a single-scalar torch.Tensor (sum of selected token log-probs).
+    Compute weighted sum of log-probs of continuation tokens conditioned on prompt.
+    Tokens in <information>...</information> spans are weighted by information_weight (default 0.0 - masked).
+    Tokens in <answer>...</answer> spans are weighted by answer_weight (default 2.0 - higher importance).
+    Tokens in <search>...</search> spans are weighted by search_weight (default 2.0 - higher importance).
+    Other tokens have weight 1.0.
+    Returns a single-scalar torch.Tensor (weighted sum of token log-probs).
     Gradients flow back to model parameters (do NOT wrap in torch.no_grad()).
     """
 
-    # Find information spans in continuation (character offsets relative to continuation)
+    # Find spans for different types of content (character offsets relative to continuation)
     info_spans: List[Tuple[int, int]] = []
+    answer_spans: List[Tuple[int, int]] = []
+    search_spans: List[Tuple[int, int]] = []
+    
+    # Find information spans
     for m in re.finditer(r"<information>.*?</information>", continuation, flags=re.DOTALL | re.IGNORECASE):
         info_spans.append((m.start(), m.end()))
+    
+    # Find answer spans
+    for m in re.finditer(r"<answer>.*?</answer>", continuation, flags=re.DOTALL | re.IGNORECASE):
+        answer_spans.append((m.start(), m.end()))
+    
+    # Find search spans
+    for m in re.finditer(r"<search>.*?</search>", continuation, flags=re.DOTALL | re.IGNORECASE):
+        search_spans.append((m.start(), m.end()))
     
     # Tokenize prompt and continuation separately (so offsets for continuation are relative to continuation text)
     enc_prompt = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
@@ -89,36 +107,63 @@ def compute_masked_logprob(
     token_log_probs = log_probs.gather(1, target_ids.unsqueeze(-1)).squeeze(-1)  # (num_cont_tokens,)
     
 
-    # Build mask: True for tokens to KEEP (not in <information>), False to drop
-    keep_mask = torch.ones_like(token_log_probs, dtype=torch.bool)
+    # Build weights: assign weights based on which spans each token belongs to
+    token_weights = torch.ones_like(token_log_probs, dtype=torch.bfloat16)
     masked_tokens = 0
+    weighted_tokens = 0
+    
     for i, (tok_start, tok_end) in enumerate(offsets):
-        # if token overlaps any info_span -> drop it
+        # Check if token overlaps with any span and assign appropriate weight
+        token_weight = 1.0  # default weight
+        
+        # Check information spans (mask - weight 0)
         for (inf_s, inf_e) in info_spans:
-            # overlap if not (tok_end <= inf_s or tok_start >= inf_e)
-            if not (tok_end <= inf_s or tok_start >= inf_e):
-                keep_mask[i] = False
+            if not (tok_end <= inf_s or tok_start >= inf_e):  # overlap detected
+                token_weight = information_weight
                 masked_tokens += 1
                 break
+        
+        # Check answer spans (higher importance)
+        if token_weight == 1.0:  # only if not already assigned
+            for (ans_s, ans_e) in answer_spans:
+                if not (tok_end <= ans_s or tok_start >= ans_e):  # overlap detected
+                    token_weight = answer_weight
+                    weighted_tokens += 1
+                    break
+        
+        # Check search spans (higher importance)
+        if token_weight == 1.0:  # only if not already assigned
+            for (search_s, search_e) in search_spans:
+                if not (tok_end <= search_s or tok_start >= search_e):  # overlap detected
+                    token_weight = search_weight
+                    weighted_tokens += 1
+                    break
+        
+        token_weights[i] = token_weight
     
-    # Sum log-probs over kept tokens
-    if keep_mask.sum().item() == 0:
-        # no tokens to train on in this continuation
-        logger.warning(f"All tokens masked out in continuation. Total tokens: {len(keep_mask)}, Info spans: {len(info_spans)}")
-        
-        
-        if return_length:
-            return torch.tensor(0.0, dtype=torch.float32), 0
-        return torch.tensor(0.0, dtype=torch.float32)
+    # Compute weighted log-probs: multiply each token's log-prob by its weight
+    # This gives higher importance to answer/search tokens and masks information tokens
+    weighted_log_probs = token_log_probs * token_weights
+    
+    # Sum weighted log-probs to get the final weighted log-probability
+    total_log_prob = weighted_log_probs.sum()
+    num_tokens = len(token_log_probs)
+    
 
-    kept_log_probs = token_log_probs[keep_mask]
     
-    total_log_prob = kept_log_probs.sum()
-    num_kept_tokens = keep_mask.sum().item()
+    # Optional: Log token weight statistics for debugging
+    # logger.debug(f"Token weights - Info: {info_tokens}, Answer: {answer_tokens}, Search: {search_tokens}, Default: {default_tokens}")
+    
+    # Check if all tokens are masked (weight 0)
+    if (token_weights == 0.0).all():
+        logger.warning(f"All tokens have zero weight in continuation. Total tokens: {num_tokens}, Info spans: {len(info_spans)}")
+        if return_length:
+            return torch.tensor(0.0, dtype=torch.bfloat16), 0
+        return torch.tensor(0.0, dtype=torch.bfloat16)
     
     
     if return_length:
-        return total_log_prob, num_kept_tokens
+        return total_log_prob, num_tokens
     return total_log_prob
 
 
@@ -504,11 +549,11 @@ def train_dpo(
                 )
                 
                 
-                # Compute masked log-probs for pos and neg continuations using current model
+                # Compute weighted log-probs for pos and neg continuations using current model
                 logp_pos_pi, pos_length = compute_masked_logprob(model, tokenizer, initial_sequence, pos_traj, device_t, return_length=True)
                 logp_neg_pi, neg_length = compute_masked_logprob(model, tokenizer, initial_sequence, neg_traj, device_t, return_length=True)
                 
-                # Compute masked log-probs for pos and neg continuations using reference model
+                # Compute weighted log-probs for pos and neg continuations using reference model
                 logp_pos_ref, _ = compute_masked_logprob(model_ref, tokenizer, initial_sequence, pos_traj, device_t, return_length=True)
                 logp_neg_ref, _ = compute_masked_logprob(model_ref, tokenizer, initial_sequence, neg_traj, device_t, return_length=True)
                 
@@ -522,6 +567,7 @@ def train_dpo(
                 avg_neg_ref = logp_neg_ref / max(1, neg_length)
 
                 print(f"avg_pos_pi: {avg_pos_pi}, avg_neg_pi: {avg_neg_pi}, avg_pos_ref: {avg_pos_ref}, avg_neg_ref: {avg_neg_ref}")
+                print(f"Using weighted logprob computation - Information tokens masked (weight=0), Answer/Search tokens weighted higher (weight=2.0)")
                 
                 
                 # DPO loss: stable form using reference model
@@ -538,7 +584,7 @@ def train_dpo(
                 
                 # Add regularization to encourage policy to assign higher probability to positive samples
                 # This helps the policy learn genuine preferences
-                positive_encouragement = F.relu(avg_pos_ref - avg_pos_pi) * 0.3  # Encourage policy to match or exceed reference on positive
+                positive_encouragement = F.relu(avg_pos_ref - avg_pos_pi) * 0.2  # Encourage policy to match or exceed reference on positive
                 
                 total_loss = dpo_loss + positive_encouragement
                 
@@ -678,16 +724,16 @@ def main():
     parser.add_argument("--e5-model-path", type=str, default="/scratch/yl9038/models/e5-large-v2", help="E5 model path (used by E5 retriever)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device for training (cuda or cpu)")
     parser.add_argument("--output-dir", type=str, default="dpo_output", help="Directory to save checkpoints")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--sample-trajectories", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=5e-6)
-    parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--save-every-steps", type=int, default=200)
     parser.add_argument("--max-data-samples", type=int, default=None, help="Maximum number of data samples to use (None for all)")
     parser.add_argument("--high-randomness", action="store_true", default=True, help="Enable high randomness mode for diverse trajectory generation (default: True)")
     parser.add_argument("--no-high-randomness", dest="high_randomness", action="store_false", help="Disable high randomness mode")
     parser.add_argument("--lora-only", action="store_true", default=False, help="Train LoRA adapter only (not full model)")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Number of gradient accumulation steps before optimizer step")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=8, help="Number of gradient accumulation steps before optimizer step")
     args = parser.parse_args()
 
     train_dpo(
