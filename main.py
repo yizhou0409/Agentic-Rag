@@ -60,6 +60,7 @@ class InferenceConfig:
     max_new_tokens: int = 2048
     greedy_thinking: bool = False  # Use greedy decoding in thinking mode
     high_randomness_mode: bool = False  # Use more aggressive random generation for diverse trajectories
+    first_step_only: bool = False  # Only generate the first step/turn
     # Retrieval settings
     top_k_docs: int = 10
     # Dataset settings
@@ -666,76 +667,114 @@ class InferenceSystem:
         max_turn_warning = "Time is up. I am not allowed to search anymore. I should give a final answer now with the information I have."
         completed_questions = []
         
-        # Process questions in turns with progress tracking
-        turn_pbar = tqdm(range(max_turns + 1), desc="Inference turns", unit="turn", position=1, leave=False) if progress_bar else range(max_turns + 1)
-        for turn_num in turn_pbar:
-            if not active_questions:
-                break
-            
-            # Update turn progress bar description
-            if progress_bar and hasattr(turn_pbar, 'set_description'):
-                turn_pbar.set_description(f"Turn {turn_num + 1}/{max_turns + 1} (Active: {len(active_questions)})")
-            
-            # Step 1: Generate responses for all active questions
-            active_questions, search_queries = self.inference_one_turn(active_questions, turn_pbar)
-            
-            # Update probe counters for search queries
-            if probe_counters is not None and search_queries:
-                probe_counters["total_search_queries"] += len(search_queries)
-            
-            # Step 2: Check for completed questions (answered or error)
-            new_completed = []
-            for question_data in active_questions:
-                last_turn = question_data["turns"][-1] if question_data["turns"] else {}
-                answer = last_turn.get("answer")
-                search_query = last_turn.get("search_query")
+        # Handle first_step_only mode
+        if self.config.first_step_only:
+            logger.info("Running in first-step-only mode - will stop after first turn")
+            # Process questions in turns with progress tracking
+            turn_pbar = tqdm(range(1), desc="Inference turns", unit="turn", position=1, leave=False) if progress_bar else range(1)
+            for turn_num in turn_pbar:
+                if not active_questions:
+                    break
                 
-                if answer:
-                    # Question answered
-                    question_data["answer"] = answer
-                    question_data["final_turn"] = turn_num + 1
-                    logger.info(f"Question {question_data['id']} completed in turn {turn_num + 1}")
-                    new_completed.append(question_data)
-                    # Update progress bar with question ID
-                    if progress_bar:
-                        progress_bar.set_description(f"Completed question {question_data['id']}")
-                        progress_bar.update(1)
-                elif not search_query:
-                    # No search query or answer found
-                    question_data["error"] = "No search query or answer found"
-                    question_data["final_turn"] = turn_num + 1
-                    logger.info(f"Question {question_data['id']} completed with error: No search query or answer found")
-                    new_completed.append(question_data)
-                    # Update progress bar with question ID
-                    if progress_bar:
-                        progress_bar.set_description(f"Completed question {question_data['id']} (error)")
-                        progress_bar.update(1)
-            
-            # Add completed questions to results
-            completed_questions.extend(new_completed)
-            
-            # Remove completed questions from active list
-            active_questions = [q for q in active_questions if q not in new_completed]
-            
-            # Step 3: Process retrievals if any search queries
-            if search_queries:
-                active_questions = self.process_retrievals(active_questions, search_queries, probe_counters)
-            
-            # Step 4: Check if max turns reached
-            if turn_num == max_turns - 1 and active_questions:
+                # Update turn progress bar description
+                if progress_bar and hasattr(turn_pbar, 'set_description'):
+                    turn_pbar.set_description(f"Turn {turn_num + 1}/1 (First step only mode)")
+                
+                # Step 1: Generate responses for all active questions
+                active_questions, search_queries = self.inference_one_turn(active_questions, turn_pbar)
+                
+                # Update probe counters for search queries
+                if probe_counters is not None and search_queries:
+                    probe_counters["total_search_queries"] += len(search_queries)
+                
+                # Step 2: Mark all questions as completed (no retrieval processing)
                 for question_data in active_questions:
-                    question_data["sequence"] += max_turn_warning
-            elif turn_num == max_turns:
-                for question_data in active_questions:
-                    question_data["error"] = "Max turns reached"
-                    question_data["final_turn"] = max_turns
-                    logger.info(f"Question {question_data['id']} completed with error: Max turns reached")
-                    completed_questions.append(question_data)
+                    question_data["final_turn"] = 1
+                    if not question_data["answer"]:
+                        question_data["error"] = "First step only - no retrieval performed"
+                        logger.info(f"Question {question_data['id']} completed in first step only mode")
+                    else:
+                        logger.info(f"Question {question_data['id']} completed with answer in first step only mode")
+                    
                     # Update progress bar with question ID
                     if progress_bar:
-                        progress_bar.set_description(f"Completed question {question_data['id']} (max turns)")
+                        progress_bar.set_description(f"Completed question {question_data['id']} (first step only)")
                         progress_bar.update(1)
+                
+                # Add all questions to results
+                completed_questions.extend(active_questions)
                 active_questions = []
+        else:
+            # Process questions in turns with progress tracking
+            turn_pbar = tqdm(range(max_turns + 1), desc="Inference turns", unit="turn", position=1, leave=False) if progress_bar else range(max_turns + 1)
+            for turn_num in turn_pbar:
+                if not active_questions:
+                    break
+                
+                # Update turn progress bar description
+                if progress_bar and hasattr(turn_pbar, 'set_description'):
+                    turn_pbar.set_description(f"Turn {turn_num + 1}/{max_turns + 1} (Active: {len(active_questions)})")
+                
+                # Step 1: Generate responses for all active questions
+                active_questions, search_queries = self.inference_one_turn(active_questions, turn_pbar)
+                
+                # Update probe counters for search queries
+                if probe_counters is not None and search_queries:
+                    probe_counters["total_search_queries"] += len(search_queries)
+                
+                # Step 2: Check for completed questions (answered or error)
+                new_completed = []
+                for question_data in active_questions:
+                    last_turn = question_data["turns"][-1] if question_data["turns"] else {}
+                    answer = last_turn.get("answer")
+                    search_query = last_turn.get("search_query")
+                    
+                    if answer:
+                        # Question answered
+                        question_data["answer"] = answer
+                        question_data["final_turn"] = turn_num + 1
+                        logger.info(f"Question {question_data['id']} completed in turn {turn_num + 1}")
+                        new_completed.append(question_data)
+                        # Update progress bar with question ID
+                        if progress_bar:
+                            progress_bar.set_description(f"Completed question {question_data['id']}")
+                            progress_bar.update(1)
+                    elif not search_query:
+                        # No search query or answer found
+                        question_data["error"] = "No search query or answer found"
+                        question_data["final_turn"] = turn_num + 1
+                        logger.info(f"Question {question_data['id']} completed with error: No search query or answer found")
+                        new_completed.append(question_data)
+                        # Update progress bar with question ID
+                        if progress_bar:
+                            progress_bar.set_description(f"Completed question {question_data['id']} (error)")
+                            progress_bar.update(1)
+                
+                # Add completed questions to results
+                completed_questions.extend(new_completed)
+                
+                # Remove completed questions from active list
+                active_questions = [q for q in active_questions if q not in new_completed]
+                
+                # Step 3: Process retrievals if any search queries
+                if search_queries:
+                    active_questions = self.process_retrievals(active_questions, search_queries, probe_counters)
+                
+                # Step 4: Check if max turns reached
+                if turn_num == max_turns - 1 and active_questions:
+                    for question_data in active_questions:
+                        question_data["sequence"] += max_turn_warning
+                elif turn_num == max_turns:
+                    for question_data in active_questions:
+                        question_data["error"] = "Max turns reached"
+                        question_data["final_turn"] = max_turns
+                        logger.info(f"Question {question_data['id']} completed with error: Max turns reached")
+                        completed_questions.append(question_data)
+                        # Update progress bar with question ID
+                        if progress_bar:
+                            progress_bar.set_description(f"Completed question {question_data['id']} (max turns)")
+                            progress_bar.update(1)
+                    active_questions = []
         
         # Calculate metrics for all results
         for result in completed_questions:
@@ -889,17 +928,24 @@ class InferenceSystem:
         total_questions = len(clean_results)
         answered_questions = sum(1 for r in clean_results if r["answer"] is not None)
         
-        avg_em = sum(r["metrics"]["em"] for r in clean_results) / total_questions
-        avg_f1 = sum(r["metrics"]["f1"] for r in clean_results) / total_questions
-        avg_cover_match = sum(r["metrics"]["cover_match"] for r in clean_results) / total_questions
-        
-        avg_turns = sum(r["final_turn"] for r in clean_results) / total_questions
+        # Handle case where no questions were processed
+        if total_questions == 0:
+            logger.warning("No questions were processed - cannot calculate metrics")
+            avg_em = 0.0
+            avg_f1 = 0.0
+            avg_cover_match = 0.0
+            avg_turns = 0.0
+        else:
+            avg_em = sum(r["metrics"]["em"] for r in clean_results) / total_questions
+            avg_f1 = sum(r["metrics"]["f1"] for r in clean_results) / total_questions
+            avg_cover_match = sum(r["metrics"]["cover_match"] for r in clean_results) / total_questions
+            avg_turns = sum(r["final_turn"] for r in clean_results) / total_questions
         
         summary = {
             "dataset": dataset_name,
             "total_questions": total_questions,
             "answered_questions": answered_questions,
-            "answer_rate": answered_questions / total_questions,
+            "answer_rate": answered_questions / total_questions if total_questions > 0 else 0.0,
             "average_em": avg_em,
             "average_f1": avg_f1,
             "average_cover_match": avg_cover_match,
@@ -936,6 +982,7 @@ def main():
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum number of turns")
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum new tokens to generate")
     parser.add_argument("--greedy-thinking", action="store_true", help="Use greedy decoding in thinking mode (no sampling)")
+    parser.add_argument("--first-step-only", action="store_true", help="Only generate the first step/turn for each question")
     
     # Retrieval settings
     parser.add_argument("--top-k-docs", type=int, default=10, help="Number of documents to retrieve")
@@ -964,6 +1011,10 @@ def main():
             args.output_dir = f"output/search_o1_probe_{args.probe_confidence_threshold}"
         else:
             args.output_dir = "output/search_o1"
+        
+        # Add first_step_only suffix if enabled
+        if args.first_step_only:
+            args.output_dir += "_first_step_only"
     
     # Create config
     config = InferenceConfig(
@@ -977,6 +1028,7 @@ def main():
         max_turns=args.max_turns,
         max_new_tokens=args.max_new_tokens,
         greedy_thinking=args.greedy_thinking,
+        first_step_only=args.first_step_only,
         top_k_docs=args.top_k_docs,
         dataset_name=args.dataset,
         split=args.split,
@@ -1019,6 +1071,12 @@ def main():
         logger.info("Greedy decoding enabled for thinking mode (deterministic reasoning)")
     else:
         logger.info("Sampling-based decoding enabled for thinking mode (creative reasoning)")
+    
+    # Log first step only configuration
+    if config.first_step_only:
+        logger.info("First-step-only mode enabled - will generate only the first turn for each question")
+    else:
+        logger.info("Full multi-turn inference mode enabled")
     
     # Determine dataset path
     dataset_path = f"data/{args.dataset}/{args.split}.jsonl"

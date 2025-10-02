@@ -348,4 +348,3 @@ def calculate_metrics(prediction: str, golden_answers: list) -> Dict[str, float]
         best_cover = max(best_cover, cover_score)
     return {"em": best_em, "f1": best_f1, "cover_match": best_cover}
 
-
