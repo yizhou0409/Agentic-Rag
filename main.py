@@ -55,6 +55,9 @@ class InferenceConfig:
     retriever_type: str = "bm25"  # or "e5"
     retriever_index_path: str = "indexes/bm25"
     e5_model_path: str = "intfloat/e5-large-v2"
+    # Prompt settings
+    reasoner_prompt_path: str = "prompts/default_QA.yaml"  # Path to reasoner prompt template
+    summarizer_prompt_path: str = "prompts/default_retrieval_summary.yaml"  # Path to summarizer prompt template
     # Generation settings
     max_turns: int = 5
     max_new_tokens: int = 2048
@@ -107,7 +110,8 @@ class Reasoner:
     
     def _load_prompt_template(self):
         """Load the prompt template for the reasoner."""
-        prompt_path = "prompts/default_QA.yaml"
+        prompt_path = self.config.reasoner_prompt_path
+        logger.info(f"Loading reasoner prompt from: {prompt_path}")
         with open(prompt_path, 'r') as f:
             prompt_data = yaml.safe_load(f)
         
@@ -217,7 +221,8 @@ class Summarizer:
     
     def _load_prompt_template(self):
         """Load the prompt template for summarization."""
-        prompt_path = "prompts/default_retrieval_summary.yaml"
+        prompt_path = self.config.summarizer_prompt_path
+        logger.info(f"Loading summarizer prompt from: {prompt_path}")
         with open(prompt_path, 'r') as f:
             prompt_data = yaml.safe_load(f)
         
@@ -978,6 +983,10 @@ def main():
     parser.add_argument("--retriever-index-path", default="indexes/bm25", help="Path to retriever index")
     parser.add_argument("--e5-model-path", default="intfloat/e5-large-v2", help="Path to E5 model for retrieval")
     
+    # Prompt settings
+    parser.add_argument("--reasoner-prompt", default="prompts/default_QA.yaml", help="Path to reasoner prompt template (e.g., prompts/free_QA.yaml)")
+    parser.add_argument("--summarizer-prompt", default="prompts/default_retrieval_summary.yaml", help="Path to summarizer prompt template")
+    
     # Generation settings
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum number of turns")
     parser.add_argument("--max-new-tokens", type=int, default=2048, help="Maximum new tokens to generate")
@@ -1025,6 +1034,8 @@ def main():
         retriever_type=args.retriever_type,
         retriever_index_path=args.retriever_index_path,
         e5_model_path=args.e5_model_path,
+        reasoner_prompt_path=args.reasoner_prompt,
+        summarizer_prompt_path=args.summarizer_prompt,
         max_turns=args.max_turns,
         max_new_tokens=args.max_new_tokens,
         greedy_thinking=args.greedy_thinking,
