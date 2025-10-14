@@ -14,3 +14,6 @@ wikipedia_e5_index/
 *.sh
 *.json
 temp/
+final/
+LLaMA-Factory/
+models/
